@@ -151,6 +151,25 @@ remote_run() {
   ssh "${SSH_OPTS[@]}" root@"$NODE" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
 }
 
+print_rule() {
+  printf "%b\n" "${CYAN}================================================================${RESET}"
+}
+
+print_title() {
+  local TITLE="$1"
+
+  print_rule
+  printf "%b\n" "${CYAN}${BOLD}$TITLE${RESET}"
+  print_rule
+}
+
+print_meta() {
+  local LABEL="$1"
+  local VALUE="$2"
+
+  printf "%b%-14s%b %s\n" "$BOLD" "$LABEL:" "$RESET" "$VALUE"
+}
+
 update_node() {
   local NODE="$1"
   local STATUS_FILE="$2"
@@ -402,8 +421,6 @@ if [ ${#NODES[@]} -eq 0 ]; then
   exit 1
 fi
 
-echo -e "${GREEN}Detected nodes:${RESET} ${DETECTED_NODES[*]}"
-echo -e "${GREEN}Selected nodes:${RESET} ${NODES[*]}"
 if [ "$MAX_PARALLEL" -eq 0 ]; then
   MAX_PARALLEL=${#NODES[@]}
 fi
@@ -412,9 +429,20 @@ if [ "$MAX_PARALLEL" -gt "${#NODES[@]}" ]; then
   MAX_PARALLEL=${#NODES[@]}
 fi
 
-echo -e "${GREEN}Update concurrency:${RESET} $MAX_PARALLEL node(s) at a time"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo -e "${YELLOW}Dry run:${RESET} package changes will be reported but not applied"
+  RUN_MODE="Dry run"
+else
+  RUN_MODE="Apply updates"
+fi
+
+clear
+print_title "Proxmox VE Cluster Update"
+print_meta "Mode" "$RUN_MODE"
+print_meta "Detected" "${DETECTED_NODES[*]}"
+print_meta "Selected" "${NODES[*]}"
+print_meta "Concurrency" "$MAX_PARALLEL node(s) at a time"
+if [ "$DRY_RUN" -eq 1 ]; then
+  print_meta "Note" "Package changes will be reported but not applied"
 fi
 sleep 1
 
@@ -427,9 +455,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ---- START UPDATES ----
 echo
-echo -e "${CYAN}${BOLD}=============================================${RESET}"
-echo -e "${CYAN}${BOLD}   Proxmox VE Cluster Update Script${RESET}"
-echo -e "${CYAN}${BOLD}=============================================${RESET}"
+print_title "Starting Node Jobs"
 
 for NODE in "${NODES[@]}"; do
   STATUS_FILE="$TMP_DIR/$NODE.status"
@@ -475,13 +501,22 @@ while :; do
   done
 
   clear
-  echo -e "${CYAN}${BOLD}Proxmox VE Cluster Update - Live Status${RESET}"
-  echo -e "${CYAN}---------------------------------------------${RESET}"
-  echo -e "${CYAN}Concurrency:${RESET} $MAX_PARALLEL node(s) at a time"
-  printf "%-18s | %s\n" "Node" "Status"
-  echo "--------------------+------------------------------------------"
+  print_title "Proxmox VE Cluster Update"
+  print_meta "Mode" "$RUN_MODE"
+  print_meta "Concurrency" "$MAX_PARALLEL node(s) at a time"
+  print_meta "Progress" "$completed_count/${#NODES[@]} complete, $running_count running"
+  echo
+  printf "%-24s  %-12s  %s\n" "Node" "State" "Status"
+  printf "%-24s  %-12s  %s\n" "------------------------" "------------" "----------------------------------------"
 
   for NODE in "${NODES[@]}"; do
+    STATE="Queued"
+    if [ "${NODE_DONE[$NODE]}" = "1" ]; then
+      STATE="Done"
+    elif [ "${NODE_STARTED[$NODE]}" = "1" ]; then
+      STATE="Running"
+    fi
+
     STATUS_FILE="$TMP_DIR/$NODE.status"
     if [ -f "$STATUS_FILE" ]; then
       STATUS_LINE=$(tail -n1 "$STATUS_FILE")
@@ -489,16 +524,17 @@ while :; do
       STATUS_LINE="(no status yet)"
     fi
 
-    printf "%-18s | %s\n" "$NODE" "$STATUS_LINE"
+    printf "%-24s  %-12s  %b\n" "$NODE" "$STATE" "$STATUS_LINE"
   done
 
-  echo -e "${CYAN}---------------------------------------------${RESET}"
+  echo
+  print_rule
   [ "$completed_count" -eq "${#NODES[@]}" ] && break
   sleep 0.5
 done
 
 echo
-echo -e "${GREEN}${BOLD}All node update jobs have finished.${RESET}"
+echo -e "${GREEN}${BOLD}All node jobs have finished.${RESET}"
 echo
 
 # ---- COLLECT SUMMARY DATA FROM FILES ----
@@ -552,14 +588,17 @@ done
 
 # ---- SUMMARY ----
 clear
-echo -e "${BOLD}${CYAN}=============================================${RESET}"
-echo -e "${BOLD}${CYAN}              UPDATE SUMMARY${RESET}"
-echo -e "${BOLD}${CYAN}=============================================${RESET}"
+print_title "Update Summary"
+print_meta "Mode" "$RUN_MODE"
+print_meta "Nodes" "${#NODES[@]} processed"
+print_meta "Failures" "${#FAILED_NODES[@]}"
+print_meta "Reboots" "${#REBOOT_NEEDED[@]}"
+echo
 
 if [ ${#REBOOT_NEEDED[@]} -eq 0 ]; then
-  echo -e "${GREEN}No nodes require a reboot.${RESET}"
+  echo -e "${GREEN}${BOLD}Reboots:${RESET} none required"
 else
-  echo -e "${YELLOW}The following nodes require a reboot:${RESET}"
+  echo -e "${YELLOW}${BOLD}Reboots required:${RESET}"
   for NODE in "${REBOOT_NEEDED[@]}"; do
     REBOOT_REASON_TEXT=${REBOOT_REASON[$NODE]:-Unknown reason}
     echo -e "  - ${BOLD}${NODE}${RESET}: $REBOOT_REASON_TEXT"
@@ -568,9 +607,9 @@ fi
 
 echo
 if [ ${#FAILED_NODES[@]} -eq 0 ]; then
-  echo -e "${GREEN}No node update failures were reported.${RESET}"
+  echo -e "${GREEN}${BOLD}Failures:${RESET} none reported"
 else
-  echo -e "${RED}The following nodes reported update failures:${RESET}"
+  echo -e "${RED}${BOLD}Failures reported:${RESET}"
   for NODE in "${FAILED_NODES[@]}"; do
     ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
     echo -e "  - ${BOLD}${NODE}${RESET}: $ERROR_TEXT"
@@ -578,7 +617,9 @@ else
 fi
 
 echo
-echo -e "${BOLD}${CYAN}Per-node package change summary:${RESET}"
+print_rule
+echo -e "${BOLD}Per-node details${RESET}"
+print_rule
 for NODE in "${NODES[@]}"; do
   COUNT=${UPDATED_COUNT[$NODE]:-0}
   PKGLIST=${UPDATED_PACKAGES[$NODE]}
@@ -590,45 +631,43 @@ for NODE in "${NODES[@]}"; do
   ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
 
   echo
-  echo -e "${YELLOW}${BOLD}$NODE${RESET}"
+  echo -e "${CYAN}${BOLD}$NODE${RESET}"
   if [ "$RESULT" = "OK" ]; then
-    echo -e "  Result: ${GREEN}OK${RESET}"
+    print_meta "  Result" "${GREEN}OK${RESET}"
   else
-    echo -e "  Result: ${RED}FAILED${RESET}"
-    echo "  Errors: $ERROR_TEXT"
+    print_meta "  Result" "${RED}FAILED${RESET}"
+    print_meta "  Errors" "$ERROR_TEXT"
   fi
-  echo -e "  Package changes: ${BOLD}$COUNT${RESET}"
+  print_meta "  Changes" "${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
-    echo -e "  Package changes:"
+    print_meta "  Packages" ""
     echo "    $PKGLIST" | fmt -w 70 | sed 's/^/    /'
   else
-    echo "  Package changes: None"
+    print_meta "  Packages" "None"
   fi
 
   if [[ -n "$PV" ]]; then
-    echo -e "  Proxmox version: ${BOLD}$PV${RESET}"
+    print_meta "  PVE" "${BOLD}$PV${RESET}"
   else
-    echo -e "  Proxmox version: ${RED}Could not be determined${RESET}"
+    print_meta "  PVE" "${RED}Could not be determined${RESET}"
   fi
 
   if [[ -n "$RK" && -n "$LK" ]]; then
-    echo -e "  Running kernel: ${BOLD}$RK${RESET}"
-    echo -e "  Latest installed kernel: ${BOLD}$LK${RESET}"
+    print_meta "  Kernel" "running ${BOLD}$RK${RESET}, latest ${BOLD}$LK${RESET}"
   elif [[ -n "$RK" ]]; then
-    echo -e "  Running kernel: ${BOLD}$RK${RESET}"
-    echo -e "  Latest installed kernel: ${RED}Unknown (no /boot/vmlinuz-* ?)${RESET}"
+    print_meta "  Kernel" "running ${BOLD}$RK${RESET}, latest ${RED}unknown${RESET}"
   else
-    echo -e "  Kernel information: ${RED}Could not be determined${RESET}"
+    print_meta "  Kernel" "${RED}Could not be determined${RESET}"
   fi
 
   if [[ -n "$REBOOT_REASON_TEXT" ]]; then
-    echo -e "  Reboot reason: ${YELLOW}$REBOOT_REASON_TEXT${RESET}"
+    print_meta "  Reboot" "${YELLOW}$REBOOT_REASON_TEXT${RESET}"
   else
-    echo -e "  Reboot reason: None detected"
+    print_meta "  Reboot" "None detected"
   fi
 done
 
 echo
-echo -e "${BOLD}${CYAN}=============================================${RESET}"
+print_rule
 echo -e "${BOLD}All nodes processed.${RESET}"
-echo -e "${BOLD}${CYAN}=============================================${RESET}"
+print_rule
