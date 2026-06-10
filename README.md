@@ -14,7 +14,7 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - Runs `apt -y autoremove`.
 - Runs `apt clean`.
 - Checks whether a reboot is likely required by comparing the running kernel with the latest installed kernel and checking `/var/run/reboot-required`.
-- Shows a final summary for each node.
+- Shows a final summary for each node, including failed update steps.
 
 ## Requirements
 
@@ -55,6 +55,8 @@ The script uses `apt -y full-upgrade`, so package prompts are answered automatic
 
 SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. These settings do not forcibly terminate a remote package command that is still running but waiting internally.
 
+If `apt update` fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. Failures from later maintenance steps are also reported in the summary.
+
 The package list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 ## Suggested Improvements
@@ -62,10 +64,8 @@ The package list in the final summary comes from the pre-upgrade simulation. If 
 - Add a serial mode, or a configurable concurrency limit, so production clusters can update one node at a time.
 - Add a dry-run mode that only performs SSH checks, `apt update`, upgrade simulation, and reboot detection.
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
-- Stop the update flow for a node if `apt update` fails, because the later upgrade simulation may be stale or misleading.
 - Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
 - Add a remote command timeout for package-management commands that are still connected but waiting indefinitely.
-- Detect and report failed nodes separately in the final summary.
 - Add an option to exclude specific nodes or target only selected nodes.
 
 ## Safety Checklist

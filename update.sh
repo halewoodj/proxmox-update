@@ -22,6 +22,7 @@ RESET='\033[0m'
 
 # ---- ARRAYS / VARIABLES ----
 REBOOT_NEEDED=()
+FAILED_NODES=()
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -34,6 +35,8 @@ declare -A UPDATED_PACKAGES
 declare -A UPDATED_COUNT
 declare -A RUNNING_KERNEL
 declare -A LATEST_KERNEL
+declare -A NODE_RESULT
+declare -A NODE_ERRORS
 declare -A NODE_PIDS
 
 # ---- CLEAR SCREEN AT START ----
@@ -56,28 +59,45 @@ update_node() {
     echo -e "$1" > "$STATUS_FILE"
   }
 
+  write_summary() {
+    local COUNT="${1:-0}"
+    local PKGS="${2:-}"
+    local RKERNEL="${3:-}"
+    local LKERNEL="${4:-}"
+    local NEED_REBOOT="${5:-0}"
+    local RESULT="${6:-OK}"
+    local ERRORS="${7:-}"
+
+    {
+      echo "COUNT|$COUNT"
+      echo "PKGS|$PKGS"
+      echo "RKERNEL|$RKERNEL"
+      echo "LKERNEL|$LKERNEL"
+      echo "REBOOT|$NEED_REBOOT"
+      echo "RESULT|$RESULT"
+      echo "ERRORS|$ERRORS"
+    } > "$SUMMARY_FILE"
+  }
+
   node_status "${CYAN}Initializing...${RESET}"
 
   # Quick SSH check
   ssh "${SSH_OPTS[@]}" root@"$NODE" 'true' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}SSH connection failed${RESET}"
-    {
-      echo "COUNT|0"
-      echo "PKGS|"
-      echo "RKERNEL|"
-      echo "LKERNEL|"
-      echo "REBOOT|0"
-    } > "$SUMMARY_FILE"
+    write_summary 0 "" "" "" 0 "FAILED" "SSH connection failed"
     return
   fi
+
+  local ERRORS=()
 
   # ---- STEP 1: apt update ----
   node_status "${CYAN}Running apt update...${RESET}"
   ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt update' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}apt update failed${RESET}"
-    # Continue anyway, but note that upgrades may not be accurate
+    write_summary 0 "" "" "" 0 "FAILED" "apt update failed"
+    return
   else
     node_status "${GREEN}apt update complete${RESET}"
   fi
@@ -108,6 +128,7 @@ update_node() {
     ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y full-upgrade' &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
+      ERRORS+=("full-upgrade failed")
     else
       node_status "${GREEN}Upgrade complete${RESET}"
     fi
@@ -118,6 +139,7 @@ update_node() {
   ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y autoremove' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}autoremove failed${RESET}"
+    ERRORS+=("autoremove failed")
   else
     node_status "${GREEN}autoremove complete${RESET}"
   fi
@@ -127,6 +149,7 @@ update_node() {
   ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt clean' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}apt clean failed${RESET}"
+    ERRORS+=("apt clean failed")
   else
     node_status "${GREEN}apt clean complete${RESET}"
   fi
@@ -149,20 +172,27 @@ update_node() {
     NEED_REBOOT=1
   fi
 
-  if [ "$NEED_REBOOT" -eq 1 ]; then
+  local RESULT="OK"
+  local ERROR_TEXT=""
+
+  if [ ${#ERRORS[@]} -gt 0 ]; then
+    RESULT="FAILED"
+    printf -v ERROR_TEXT "%s; " "${ERRORS[@]}"
+    ERROR_TEXT=${ERROR_TEXT%; }
+  fi
+
+  if [ "$NEED_REBOOT" -eq 1 ] && [ "$RESULT" = "FAILED" ]; then
+    node_status "${RED}Completed with errors${RESET}${YELLOW} (reboot required)${RESET}"
+  elif [ "$NEED_REBOOT" -eq 1 ]; then
     node_status "${YELLOW}Completed (reboot required)${RESET}"
+  elif [ "$RESULT" = "FAILED" ]; then
+    node_status "${RED}Completed with errors${RESET}"
   else
     node_status "${GREEN}Completed (no reboot needed)${RESET}"
   fi
 
   # ---- WRITE SUMMARY FILE ----
-  {
-    echo "COUNT|$COUNT"
-    echo "PKGS|$PKGS"
-    echo "RKERNEL|$RKERNEL"
-    echo "LKERNEL|$LKERNEL"
-    echo "REBOOT|$NEED_REBOOT"
-  } > "$SUMMARY_FILE"
+  write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "$RESULT" "$ERROR_TEXT"
 }
 
 # ---- DETECT CLUSTER NODES ----
@@ -259,8 +289,12 @@ for NODE in "${NODES[@]}"; do
   RK=""
   LK=""
   REBOOT=0
+  RESULT="FAILED"
+  ERRORS="No summary file was written"
 
   if [ -f "$SUMMARY_FILE" ]; then
+    RESULT="OK"
+    ERRORS=""
     while IFS="|" read -r key value; do
       case "$key" in
         COUNT)   COUNT="$value" ;;
@@ -268,6 +302,8 @@ for NODE in "${NODES[@]}"; do
         RKERNEL) RK="$value" ;;
         LKERNEL) LK="$value" ;;
         REBOOT)  REBOOT="$value" ;;
+        RESULT)  RESULT="$value" ;;
+        ERRORS)  ERRORS="$value" ;;
       esac
     done < "$SUMMARY_FILE"
   fi
@@ -276,9 +312,15 @@ for NODE in "${NODES[@]}"; do
   UPDATED_PACKAGES["$NODE"]="$PKGS"
   RUNNING_KERNEL["$NODE"]="$RK"
   LATEST_KERNEL["$NODE"]="$LK"
+  NODE_RESULT["$NODE"]="$RESULT"
+  NODE_ERRORS["$NODE"]="$ERRORS"
 
   if [ "$REBOOT" = "1" ]; then
     REBOOT_NEEDED+=("$NODE")
+  fi
+
+  if [ "$RESULT" != "OK" ]; then
+    FAILED_NODES+=("$NODE")
   fi
 done
 
@@ -298,15 +340,34 @@ else
 fi
 
 echo
+if [ ${#FAILED_NODES[@]} -eq 0 ]; then
+  echo -e "${GREEN}No node update failures were reported.${RESET}"
+else
+  echo -e "${RED}The following nodes reported update failures:${RESET}"
+  for NODE in "${FAILED_NODES[@]}"; do
+    ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
+    echo -e "  - ${BOLD}${NODE}${RESET}: $ERROR_TEXT"
+  done
+fi
+
+echo
 echo -e "${BOLD}${CYAN}Per-node package update summary:${RESET}"
 for NODE in "${NODES[@]}"; do
   COUNT=${UPDATED_COUNT[$NODE]:-0}
   PKGLIST=${UPDATED_PACKAGES[$NODE]}
   RK=${RUNNING_KERNEL[$NODE]}
   LK=${LATEST_KERNEL[$NODE]}
+  RESULT=${NODE_RESULT[$NODE]:-FAILED}
+  ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
 
   echo
   echo -e "${YELLOW}${BOLD}$NODE${RESET}"
+  if [ "$RESULT" = "OK" ]; then
+    echo -e "  Result: ${GREEN}OK${RESET}"
+  else
+    echo -e "  Result: ${RED}FAILED${RESET}"
+    echo "  Errors: $ERROR_TEXT"
+  fi
   echo -e "  Packages updated: ${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
     echo -e "  Package list:"
