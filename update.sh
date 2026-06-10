@@ -3,7 +3,7 @@
 # Proxmox VE Cluster Update Script
 # =============================================
 # - Auto-detects cluster nodes via pvecm
-# - Runs updates on all nodes in parallel
+# - Runs updates one node at a time by default
 # - Shows a live status dashboard for all nodes
 # - Summarises updated packages and kernel info
 #
@@ -20,9 +20,21 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+
+Options:
+  -j, --jobs N      Number of nodes to update at once (default: 1)
+  -p, --parallel    Update all detected nodes at once
+  -h, --help        Show this help message
+EOF
+}
+
 # ---- ARRAYS / VARIABLES ----
 REBOOT_NEEDED=()
 FAILED_NODES=()
+MAX_PARALLEL=1
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -31,6 +43,38 @@ SSH_OPTS=(
   -o ServerAliveCountMax=4
 )
 
+# ---- ARGUMENT PARSING ----
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -j|--jobs)
+      if [ -z "${2:-}" ] || [[ ! "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1 ]; then
+        echo -e "${RED}Error: --jobs requires a positive integer.${RESET}"
+        exit 1
+      fi
+      MAX_PARALLEL="$2"
+      shift 2
+      ;;
+    -p|--parallel)
+      MAX_PARALLEL=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo -e "${RED}Error: unknown option '$1'.${RESET}"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo -e "${RED}Error: this script requires Bash 4 or newer.${RESET}"
+  exit 1
+fi
+
 declare -A UPDATED_PACKAGES
 declare -A UPDATED_COUNT
 declare -A RUNNING_KERNEL
@@ -38,6 +82,8 @@ declare -A LATEST_KERNEL
 declare -A NODE_RESULT
 declare -A NODE_ERRORS
 declare -A NODE_PIDS
+declare -A NODE_STARTED
+declare -A NODE_DONE
 
 # ---- CLEAR SCREEN AT START ----
 clear
@@ -222,6 +268,15 @@ if [ ${#NODES[@]} -eq 0 ]; then
 fi
 
 echo -e "${GREEN}Detected nodes:${RESET} ${NODES[*]}"
+if [ "$MAX_PARALLEL" -eq 0 ]; then
+  MAX_PARALLEL=${#NODES[@]}
+fi
+
+if [ "$MAX_PARALLEL" -gt "${#NODES[@]}" ]; then
+  MAX_PARALLEL=${#NODES[@]}
+fi
+
+echo -e "${GREEN}Update concurrency:${RESET} $MAX_PARALLEL node(s) at a time"
 sleep 1
 
 # ---- TEMP DIR FOR STATUS & SUMMARY FILES ----
@@ -231,37 +286,63 @@ TMP_DIR=$(mktemp -d /tmp/proxmox-update.XXXXXX) || {
 }
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# ---- START PARALLEL UPDATES ----
+# ---- START UPDATES ----
 echo
 echo -e "${CYAN}${BOLD}=============================================${RESET}"
 echo -e "${CYAN}${BOLD}   Proxmox VE Cluster Update Script${RESET}"
 echo -e "${CYAN}${BOLD}=============================================${RESET}"
 
-# Launch one background job per node
 for NODE in "${NODES[@]}"; do
   STATUS_FILE="$TMP_DIR/$NODE.status"
-  SUMMARY_FILE="$TMP_DIR/$NODE.summary"
   echo -e "${YELLOW}Queued...${RESET}" > "$STATUS_FILE"
-  update_node "$NODE" "$STATUS_FILE" "$SUMMARY_FILE" &
-  NODE_PIDS["$NODE"]=$!
+  NODE_STARTED["$NODE"]=0
+  NODE_DONE["$NODE"]=0
 done
 
 # ---- LIVE DASHBOARD LOOP ----
 while :; do
+  running_count=0
+  completed_count=0
+
+  for NODE in "${NODES[@]}"; do
+    if [ "${NODE_STARTED[$NODE]}" = "1" ] && [ "${NODE_DONE[$NODE]}" = "0" ]; then
+      pid="${NODE_PIDS["$NODE"]}"
+      if kill -0 "$pid" 2>/dev/null; then
+        running_count=$((running_count + 1))
+      else
+        wait "$pid" 2>/dev/null
+        NODE_DONE["$NODE"]=1
+      fi
+    fi
+
+    if [ "${NODE_DONE[$NODE]}" = "1" ]; then
+      completed_count=$((completed_count + 1))
+    fi
+  done
+
+  for NODE in "${NODES[@]}"; do
+    if [ "$running_count" -ge "$MAX_PARALLEL" ]; then
+      break
+    fi
+
+    if [ "${NODE_STARTED[$NODE]}" = "0" ]; then
+      STATUS_FILE="$TMP_DIR/$NODE.status"
+      SUMMARY_FILE="$TMP_DIR/$NODE.summary"
+      update_node "$NODE" "$STATUS_FILE" "$SUMMARY_FILE" &
+      NODE_PIDS["$NODE"]=$!
+      NODE_STARTED["$NODE"]=1
+      running_count=$((running_count + 1))
+    fi
+  done
+
   clear
   echo -e "${CYAN}${BOLD}Proxmox VE Cluster Update - Live Status${RESET}"
   echo -e "${CYAN}---------------------------------------------${RESET}"
+  echo -e "${CYAN}Concurrency:${RESET} $MAX_PARALLEL node(s) at a time"
   printf "%-18s | %s\n" "Node" "Status"
   echo "--------------------+------------------------------------------"
 
-  all_done=true
-
   for NODE in "${NODES[@]}"; do
-    pid="${NODE_PIDS["$NODE"]}"
-    if kill -0 "$pid" 2>/dev/null; then
-      all_done=false
-    fi
-
     STATUS_FILE="$TMP_DIR/$NODE.status"
     if [ -f "$STATUS_FILE" ]; then
       STATUS_LINE=$(tail -n1 "$STATUS_FILE")
@@ -273,7 +354,7 @@ while :; do
   done
 
   echo -e "${CYAN}---------------------------------------------${RESET}"
-  $all_done && break
+  [ "$completed_count" -eq "${#NODES[@]}" ] && break
   sleep 0.5
 done
 

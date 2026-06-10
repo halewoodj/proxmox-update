@@ -2,12 +2,13 @@
 
 `update.sh` is a Bash helper for updating every node in a Proxmox VE cluster from a single Proxmox node.
 
-It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, runs package maintenance in parallel, displays a live status table, and prints a final per-node summary with package and kernel information.
+It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, runs package maintenance with configurable concurrency, displays a live status table, and prints a final per-node summary with package and kernel information.
 
 ## What It Does
 
 - Detects Proxmox VE cluster nodes automatically.
 - Verifies SSH access to each node before updating it.
+- Updates one node at a time by default.
 - Runs `apt update`.
 - Simulates `apt-get full-upgrade` to list packages expected to change.
 - Runs `apt -y full-upgrade` when upgrades are available.
@@ -45,11 +46,23 @@ Run it as root from a Proxmox VE cluster node:
 ./update.sh
 ```
 
+By default, the script updates one node at a time. To update more than one node at once, set an explicit job count:
+
+```bash
+./update.sh --jobs 2
+```
+
+To update all detected nodes at once, use:
+
+```bash
+./update.sh --parallel
+```
+
 The script does not reboot nodes automatically. If the final summary reports that one or more nodes require a reboot, reboot them manually in a controlled order that is appropriate for your cluster workloads.
 
 ## Important Notes
 
-The script runs updates on all detected nodes in parallel. This is convenient, but it may be risky for production clusters if every node hosts critical guests, storage services, or quorum-sensitive workloads. For production environments, consider updating one node at a time after migrating or shutting down affected workloads.
+The script updates one node at a time unless you pass `--jobs` or `--parallel`. Increasing concurrency can be useful in lab clusters or planned maintenance windows, but it may be risky for production clusters if multiple nodes host critical guests, storage services, or quorum-sensitive workloads.
 
 The script uses `apt -y full-upgrade`, so package prompts are answered automatically where possible. Repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
 
@@ -61,7 +74,6 @@ The package list in the final summary comes from the pre-upgrade simulation. If 
 
 ## Suggested Improvements
 
-- Add a serial mode, or a configurable concurrency limit, so production clusters can update one node at a time.
 - Add a dry-run mode that only performs SSH checks, `apt update`, upgrade simulation, and reboot detection.
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
 - Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
