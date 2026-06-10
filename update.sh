@@ -13,12 +13,12 @@
 # =============================================
 
 # ---- COLORS ----
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 usage() {
   cat <<EOF
@@ -152,7 +152,11 @@ remote_run() {
 }
 
 print_rule() {
-  printf "%b\n" "${CYAN}================================================================${RESET}"
+  local WIDTH="${RULE_WIDTH:-80}"
+  local LINE
+
+  LINE=$(printf "%*s" "$WIDTH" "" | tr ' ' '=')
+  printf "%b\n" "${CYAN}${LINE}${RESET}"
 }
 
 print_title() {
@@ -168,6 +172,13 @@ print_meta() {
   local VALUE="$2"
 
   printf "%b%-14s%b %s\n" "$BOLD" "$LABEL:" "$RESET" "$VALUE"
+}
+
+repeat_char() {
+  local CHAR="$1"
+  local COUNT="$2"
+
+  printf "%*s" "$COUNT" "" | tr ' ' "$CHAR"
 }
 
 update_node() {
@@ -435,6 +446,22 @@ else
   RUN_MODE="Apply updates"
 fi
 
+NODE_COL_WIDTH=12
+for NODE in "${NODES[@]}"; do
+  NODE_WIDTH=$((${#NODE} + 2))
+  if [ "$NODE_WIDTH" -gt "$NODE_COL_WIDTH" ]; then
+    NODE_COL_WIDTH="$NODE_WIDTH"
+  fi
+done
+
+if [ "$NODE_COL_WIDTH" -gt 24 ]; then
+  NODE_COL_WIDTH=24
+fi
+
+STATE_COL_WIDTH=8
+STATUS_COL_WIDTH=44
+RULE_WIDTH=$((NODE_COL_WIDTH + 2 + STATE_COL_WIDTH + 2 + STATUS_COL_WIDTH))
+
 clear
 print_title "Proxmox VE Cluster Update"
 print_meta "Mode" "$RUN_MODE"
@@ -506,8 +533,11 @@ while :; do
   print_meta "Concurrency" "$MAX_PARALLEL node(s) at a time"
   print_meta "Progress" "$completed_count/${#NODES[@]} complete, $running_count running"
   echo
-  printf "%-24s  %-12s  %s\n" "Node" "State" "Status"
-  printf "%-24s  %-12s  %s\n" "------------------------" "------------" "----------------------------------------"
+  printf "%-*s  %-*s  %s\n" "$NODE_COL_WIDTH" "Node" "$STATE_COL_WIDTH" "State" "Status"
+  printf "%-*s  %-*s  %s\n" \
+    "$NODE_COL_WIDTH" "$(repeat_char '-' "$NODE_COL_WIDTH")" \
+    "$STATE_COL_WIDTH" "$(repeat_char '-' "$STATE_COL_WIDTH")" \
+    "$(repeat_char '-' "$STATUS_COL_WIDTH")"
 
   for NODE in "${NODES[@]}"; do
     STATE="Queued"
@@ -524,7 +554,7 @@ while :; do
       STATUS_LINE="(no status yet)"
     fi
 
-    printf "%-24s  %-12s  %b\n" "$NODE" "$STATE" "$STATUS_LINE"
+    printf "%-*s  %-*s  %b\n" "$NODE_COL_WIDTH" "$NODE" "$STATE_COL_WIDTH" "$STATE" "$STATUS_LINE"
   done
 
   echo
