@@ -10,12 +10,12 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - Verifies SSH access to each node before updating it.
 - Updates one node at a time by default.
 - Runs `apt update`.
-- Simulates `apt-get full-upgrade` to list packages expected to change.
+- Simulates `apt-get full-upgrade` to list packages expected to be installed, upgraded, or removed.
 - Runs `apt -y full-upgrade` when upgrades are available.
 - Runs `apt -y autoremove`.
 - Runs `apt clean`.
 - Checks whether a reboot is likely required by comparing the running kernel with the latest installed kernel and checking `/var/run/reboot-required`.
-- Shows a final summary for each node, including failed update steps.
+- Shows a final summary for each node, including package changes and failed update steps.
 
 ## Requirements
 
@@ -68,9 +68,9 @@ The script uses `apt -y full-upgrade`, so package prompts are answered automatic
 
 SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. These settings do not forcibly terminate a remote package command that is still running but waiting internally.
 
-If `apt update` fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. Failures from later maintenance steps are also reported in the summary.
+If `apt update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `full-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
 
-The package list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
+The package change list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 ## Suggested Improvements
 

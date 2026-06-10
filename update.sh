@@ -151,22 +151,33 @@ update_node() {
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
   UPGRADE_SIM=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -s full-upgrade' 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    node_status "${RED}Upgrade simulation failed${RESET}"
+    write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
+    return
+  fi
 
-  PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '
-    /The following packages will be upgraded:/ {flag=1; next}
-    flag && NF==0 {flag=0}
-    flag && NF>0 {
-      gsub(/^ +| +$/, "")
-      printf "%s ", $0
-    }
-  ' | sed 's/ *$//')
+  INST_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Inst / {printf "%s ", $2}' | sed 's/ *$//')
+  REMV_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Remv / {printf "%s ", $2}' | sed 's/ *$//')
+
+  PKGS=""
+  if [ -n "$INST_PKGS" ]; then
+    PKGS="Install/upgrade: $INST_PKGS"
+  fi
+  if [ -n "$REMV_PKGS" ]; then
+    if [ -n "$PKGS" ]; then
+      PKGS="$PKGS; Remove: $REMV_PKGS"
+    else
+      PKGS="Remove: $REMV_PKGS"
+    fi
+  fi
 
   local COUNT=0
-  if [ -n "$PKGS" ]; then
-    COUNT=$(wc -w <<< "$PKGS" | awk '{print $1}')
-    node_status "${CYAN}Upgrading ${BOLD}$COUNT${RESET}${CYAN} package(s)...${RESET}"
+  if [ -n "$INST_PKGS" ] || [ -n "$REMV_PKGS" ]; then
+    COUNT=$(( $(wc -w <<< "$INST_PKGS") + $(wc -w <<< "$REMV_PKGS") ))
+    node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
   else
-    node_status "${GREEN}No packages need upgrading${RESET}"
+    node_status "${GREEN}No package changes needed${RESET}"
   fi
 
   # ---- STEP 2: full-upgrade ----
@@ -174,10 +185,11 @@ update_node() {
     ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y full-upgrade' &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
-      ERRORS+=("full-upgrade failed")
-    else
-      node_status "${GREEN}Upgrade complete${RESET}"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "full-upgrade failed"
+      return
     fi
+
+    node_status "${GREEN}Upgrade complete${RESET}"
   fi
 
   # ---- STEP 3: autoremove ----
@@ -432,7 +444,7 @@ else
 fi
 
 echo
-echo -e "${BOLD}${CYAN}Per-node package update summary:${RESET}"
+echo -e "${BOLD}${CYAN}Per-node package change summary:${RESET}"
 for NODE in "${NODES[@]}"; do
   COUNT=${UPDATED_COUNT[$NODE]:-0}
   PKGLIST=${UPDATED_PACKAGES[$NODE]}
@@ -449,12 +461,12 @@ for NODE in "${NODES[@]}"; do
     echo -e "  Result: ${RED}FAILED${RESET}"
     echo "  Errors: $ERROR_TEXT"
   fi
-  echo -e "  Packages updated: ${BOLD}$COUNT${RESET}"
+  echo -e "  Package changes: ${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
-    echo -e "  Package list:"
+    echo -e "  Package changes:"
     echo "    $PKGLIST" | fmt -w 70 | sed 's/^/    /'
   else
-    echo "  Package list: None"
+    echo "  Package changes: None"
   fi
 
   if [[ -n "$RK" && -n "$LK" ]]; then
