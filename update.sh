@@ -27,6 +27,10 @@ Usage: $0 [options]
 Options:
   -j, --jobs N      Number of nodes to update at once (default: 1)
   -p, --parallel    Update all detected nodes at once
+  -n, --dry-run     Check updates and reboot status without changing packages
+      --nodes LIST  Only process comma-separated node names
+      --exclude LIST
+                    Exclude comma-separated node names
   -h, --help        Show this help message
 EOF
 }
@@ -35,6 +39,9 @@ EOF
 REBOOT_NEEDED=()
 FAILED_NODES=()
 MAX_PARALLEL=1
+DRY_RUN=0
+ONLY_NODES=()
+EXCLUDE_NODES=()
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -57,6 +64,26 @@ while [ "$#" -gt 0 ]; do
     -p|--parallel)
       MAX_PARALLEL=0
       shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --nodes)
+      if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: --nodes requires a comma-separated node list.${RESET}"
+        exit 1
+      fi
+      IFS=',' read -r -a ONLY_NODES <<< "$2"
+      shift 2
+      ;;
+    --exclude)
+      if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: --exclude requires a comma-separated node list.${RESET}"
+        exit 1
+      fi
+      IFS=',' read -r -a EXCLUDE_NODES <<< "$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -95,10 +122,28 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ---- FUNCTIONS ----
+list_contains() {
+  local NEEDLE="$1"
+  shift
+
+  for ITEM in "$@"; do
+    if [ "$ITEM" = "$NEEDLE" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 update_node() {
   local NODE="$1"
   local STATUS_FILE="$2"
   local SUMMARY_FILE="$3"
+  local MODE_LABEL=""
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    MODE_LABEL=" (dry run)"
+  fi
 
   # Helper to write a single-line status
   node_status() {
@@ -175,13 +220,17 @@ update_node() {
   local COUNT=0
   if [ -n "$INST_PKGS" ] || [ -n "$REMV_PKGS" ]; then
     COUNT=$(( $(wc -w <<< "$INST_PKGS") + $(wc -w <<< "$REMV_PKGS") ))
-    node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      node_status "${CYAN}Found ${BOLD}$COUNT${RESET}${CYAN} package change(s)${MODE_LABEL}${RESET}"
+    else
+      node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
+    fi
   else
     node_status "${GREEN}No package changes needed${RESET}"
   fi
 
   # ---- STEP 2: dist-upgrade ----
-  if [ "$COUNT" -gt 0 ]; then
+  if [ "$COUNT" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
     ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y dist-upgrade' &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
@@ -193,23 +242,27 @@ update_node() {
   fi
 
   # ---- STEP 3: autoremove ----
-  node_status "${CYAN}Removing unused packages...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y autoremove' &>/dev/null
-  if [ $? -ne 0 ]; then
-    node_status "${RED}autoremove failed${RESET}"
-    ERRORS+=("autoremove failed")
-  else
-    node_status "${GREEN}autoremove complete${RESET}"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    node_status "${CYAN}Removing unused packages...${RESET}"
+    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y autoremove' &>/dev/null
+    if [ $? -ne 0 ]; then
+      node_status "${RED}autoremove failed${RESET}"
+      ERRORS+=("autoremove failed")
+    else
+      node_status "${GREEN}autoremove complete${RESET}"
+    fi
   fi
 
   # ---- STEP 4: clean ----
-  node_status "${CYAN}Cleaning package cache...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get clean' &>/dev/null
-  if [ $? -ne 0 ]; then
-    node_status "${RED}apt-get clean failed${RESET}"
-    ERRORS+=("apt-get clean failed")
-  else
-    node_status "${GREEN}apt-get clean complete${RESET}"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    node_status "${CYAN}Cleaning package cache...${RESET}"
+    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get clean' &>/dev/null
+    if [ $? -ne 0 ]; then
+      node_status "${RED}apt-get clean failed${RESET}"
+      ERRORS+=("apt-get clean failed")
+    else
+      node_status "${GREEN}apt-get clean complete${RESET}"
+    fi
   fi
 
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
@@ -240,13 +293,13 @@ update_node() {
   fi
 
   if [ "$NEED_REBOOT" -eq 1 ] && [ "$RESULT" = "FAILED" ]; then
-    node_status "${RED}Completed with errors${RESET}${YELLOW} (reboot required)${RESET}"
+    node_status "${RED}Completed with errors${RESET}${YELLOW} (reboot required)${RESET}${CYAN}${MODE_LABEL}${RESET}"
   elif [ "$NEED_REBOOT" -eq 1 ]; then
-    node_status "${YELLOW}Completed (reboot required)${RESET}"
+    node_status "${YELLOW}Completed (reboot required)${RESET}${CYAN}${MODE_LABEL}${RESET}"
   elif [ "$RESULT" = "FAILED" ]; then
-    node_status "${RED}Completed with errors${RESET}"
+    node_status "${RED}Completed with errors${RESET}${CYAN}${MODE_LABEL}${RESET}"
   else
-    node_status "${GREEN}Completed (no reboot needed)${RESET}"
+    node_status "${GREEN}Completed (no reboot needed)${RESET}${CYAN}${MODE_LABEL}${RESET}"
   fi
 
   # ---- WRITE SUMMARY FILE ----
@@ -279,7 +332,48 @@ if [ ${#NODES[@]} -eq 0 ]; then
   exit 1
 fi
 
-echo -e "${GREEN}Detected nodes:${RESET} ${NODES[*]}"
+DETECTED_NODES=("${NODES[@]}")
+
+if [ ${#ONLY_NODES[@]} -gt 0 ]; then
+  for NODE in "${ONLY_NODES[@]}"; do
+    if ! list_contains "$NODE" "${DETECTED_NODES[@]}"; then
+      echo -e "${RED}Error: requested node '$NODE' was not detected by 'pvecm nodes'.${RESET}"
+      exit 1
+    fi
+  done
+fi
+
+if [ ${#EXCLUDE_NODES[@]} -gt 0 ]; then
+  for NODE in "${EXCLUDE_NODES[@]}"; do
+    if ! list_contains "$NODE" "${DETECTED_NODES[@]}"; then
+      echo -e "${RED}Error: excluded node '$NODE' was not detected by 'pvecm nodes'.${RESET}"
+      exit 1
+    fi
+  done
+fi
+
+FILTERED_NODES=()
+for NODE in "${DETECTED_NODES[@]}"; do
+  if [ ${#ONLY_NODES[@]} -gt 0 ] && ! list_contains "$NODE" "${ONLY_NODES[@]}"; then
+    continue
+  fi
+
+  if [ ${#EXCLUDE_NODES[@]} -gt 0 ] && list_contains "$NODE" "${EXCLUDE_NODES[@]}"; then
+    continue
+  fi
+
+  FILTERED_NODES+=("$NODE")
+done
+
+NODES=("${FILTERED_NODES[@]}")
+
+if [ ${#NODES[@]} -eq 0 ]; then
+  echo -e "${RED}Error: node filters matched no nodes.${RESET}"
+  exit 1
+fi
+
+echo -e "${GREEN}Detected nodes:${RESET} ${DETECTED_NODES[*]}"
+echo -e "${GREEN}Selected nodes:${RESET} ${NODES[*]}"
 if [ "$MAX_PARALLEL" -eq 0 ]; then
   MAX_PARALLEL=${#NODES[@]}
 fi
@@ -289,6 +383,9 @@ if [ "$MAX_PARALLEL" -gt "${#NODES[@]}" ]; then
 fi
 
 echo -e "${GREEN}Update concurrency:${RESET} $MAX_PARALLEL node(s) at a time"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo -e "${YELLOW}Dry run:${RESET} package changes will be reported but not applied"
+fi
 sleep 1
 
 # ---- TEMP DIR FOR STATUS & SUMMARY FILES ----

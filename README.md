@@ -9,6 +9,8 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - Detects Proxmox VE cluster nodes automatically.
 - Verifies SSH access to each node before updating it.
 - Updates one node at a time by default.
+- Supports dry-run checks without applying package changes.
+- Supports selecting or excluding specific nodes.
 - Runs `apt-get update`.
 - Simulates `apt-get dist-upgrade` to list packages expected to be installed, upgraded, or removed.
 - Runs `apt-get -y dist-upgrade` when package changes are available.
@@ -58,6 +60,30 @@ To update all detected nodes at once, use:
 ./update.sh --parallel
 ```
 
+To check available package changes and reboot status without applying package changes, use:
+
+```bash
+./update.sh --dry-run
+```
+
+To process only specific nodes, use a comma-separated list:
+
+```bash
+./update.sh --nodes pve1,pve3
+```
+
+To skip specific nodes, use:
+
+```bash
+./update.sh --exclude pve2
+```
+
+You can combine these options:
+
+```bash
+./update.sh --dry-run --nodes pve1,pve3 --jobs 2
+```
+
 The script does not reboot nodes automatically. If the final summary reports that one or more nodes require a reboot, reboot them manually in a controlled order that is appropriate for your cluster workloads.
 
 ## Important Notes
@@ -70,15 +96,15 @@ SSH commands use batch mode, a 10-second connection timeout, one connection atte
 
 If `apt-get update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `dist-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
 
+In dry-run mode, the script still runs `apt-get update`, upgrade simulation, and reboot checks on selected nodes. It does not run `dist-upgrade`, `autoremove`, or `clean`.
+
 The package change list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 ## Suggested Improvements
 
-- Add a dry-run mode that only performs SSH checks, `apt-get update`, upgrade simulation, and reboot detection.
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
 - Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
 - Add a remote command timeout for package-management commands that are still connected but waiting indefinitely.
-- Add an option to exclude specific nodes or target only selected nodes.
 
 ## Safety Checklist
 
