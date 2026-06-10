@@ -137,20 +137,20 @@ update_node() {
 
   local ERRORS=()
 
-  # ---- STEP 1: apt update ----
-  node_status "${CYAN}Running apt update...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt update' &>/dev/null
+  # ---- STEP 1: apt-get update ----
+  node_status "${CYAN}Running apt-get update...${RESET}"
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get update' &>/dev/null
   if [ $? -ne 0 ]; then
-    node_status "${RED}apt update failed${RESET}"
-    write_summary 0 "" "" "" 0 "FAILED" "apt update failed"
+    node_status "${RED}apt-get update failed${RESET}"
+    write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
     return
   else
-    node_status "${GREEN}apt update complete${RESET}"
+    node_status "${GREEN}apt-get update complete${RESET}"
   fi
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -s full-upgrade' 2>/dev/null)
+  UPGRADE_SIM=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -s dist-upgrade' 2>/dev/null)
   if [ $? -ne 0 ]; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
@@ -180,12 +180,12 @@ update_node() {
     node_status "${GREEN}No package changes needed${RESET}"
   fi
 
-  # ---- STEP 2: full-upgrade ----
+  # ---- STEP 2: dist-upgrade ----
   if [ "$COUNT" -gt 0 ]; then
-    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y full-upgrade' &>/dev/null
+    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y dist-upgrade' &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
-      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "full-upgrade failed"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "dist-upgrade failed"
       return
     fi
 
@@ -194,7 +194,7 @@ update_node() {
 
   # ---- STEP 3: autoremove ----
   node_status "${CYAN}Removing unused packages...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y autoremove' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y autoremove' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}autoremove failed${RESET}"
     ERRORS+=("autoremove failed")
@@ -204,12 +204,12 @@ update_node() {
 
   # ---- STEP 4: clean ----
   node_status "${CYAN}Cleaning package cache...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt clean' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get clean' &>/dev/null
   if [ $? -ne 0 ]; then
-    node_status "${RED}apt clean failed${RESET}"
-    ERRORS+=("apt clean failed")
+    node_status "${RED}apt-get clean failed${RESET}"
+    ERRORS+=("apt-get clean failed")
   else
-    node_status "${GREEN}apt clean complete${RESET}"
+    node_status "${GREEN}apt-get clean complete${RESET}"
   fi
 
   # ---- CHECK KERNEL VERSIONS / REBOOT ----

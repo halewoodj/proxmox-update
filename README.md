@@ -9,11 +9,11 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - Detects Proxmox VE cluster nodes automatically.
 - Verifies SSH access to each node before updating it.
 - Updates one node at a time by default.
-- Runs `apt update`.
-- Simulates `apt-get full-upgrade` to list packages expected to be installed, upgraded, or removed.
-- Runs `apt -y full-upgrade` when upgrades are available.
-- Runs `apt -y autoremove`.
-- Runs `apt clean`.
+- Runs `apt-get update`.
+- Simulates `apt-get dist-upgrade` to list packages expected to be installed, upgraded, or removed.
+- Runs `apt-get -y dist-upgrade` when package changes are available.
+- Runs `apt-get -y autoremove`.
+- Runs `apt-get clean`.
 - Checks whether a reboot is likely required by comparing the running kernel with the latest installed kernel and checking `/var/run/reboot-required`.
 - Shows a final summary for each node, including package changes and failed update steps.
 
@@ -64,17 +64,17 @@ The script does not reboot nodes automatically. If the final summary reports tha
 
 The script updates one node at a time unless you pass `--jobs` or `--parallel`. Increasing concurrency can be useful in lab clusters or planned maintenance windows, but it may be risky for production clusters if multiple nodes host critical guests, storage services, or quorum-sensitive workloads.
 
-The script uses `apt -y full-upgrade`, so package prompts are answered automatically where possible. Repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
+The script uses `apt-get -y dist-upgrade`, following Proxmox's documented CLI update path. Package prompts are answered automatically where possible, but repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
 
 SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. These settings do not forcibly terminate a remote package command that is still running but waiting internally.
 
-If `apt update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `full-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
+If `apt-get update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `dist-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
 
 The package change list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 ## Suggested Improvements
 
-- Add a dry-run mode that only performs SSH checks, `apt update`, upgrade simulation, and reboot detection.
+- Add a dry-run mode that only performs SSH checks, `apt-get update`, upgrade simulation, and reboot detection.
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
 - Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
 - Add a remote command timeout for package-management commands that are still connected but waiting indefinitely.
