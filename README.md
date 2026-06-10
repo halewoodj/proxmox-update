@@ -16,7 +16,9 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - Runs `apt-get -y dist-upgrade` when package changes are available.
 - Runs `apt-get -y autoremove`.
 - Runs `apt-get clean`.
+- Reports the Proxmox VE version for each node.
 - Checks whether a reboot is likely required by comparing the running kernel with the latest installed kernel and checking `/var/run/reboot-required`.
+- Reports the reason a reboot is needed when detected.
 - Shows a final summary for each node, including package changes and failed update steps.
 
 ## Requirements
@@ -101,6 +103,8 @@ If `apt-get update` or the upgrade simulation fails on a node, that node is skip
 In dry-run mode, the script still runs `apt-get update`, upgrade simulation, and reboot checks on selected nodes. It does not run `dist-upgrade`, `autoremove`, or `clean`.
 
 The package change list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
+
+Reboot reasons are reported as `kernel mismatch`, `/var/run/reboot-required`, or both.
 
 ## Suggested Improvements
 

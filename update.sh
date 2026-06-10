@@ -112,6 +112,8 @@ declare -A UPDATED_PACKAGES
 declare -A UPDATED_COUNT
 declare -A RUNNING_KERNEL
 declare -A LATEST_KERNEL
+declare -A PVE_VERSION
+declare -A REBOOT_REASON
 declare -A NODE_RESULT
 declare -A NODE_ERRORS
 declare -A NODE_PIDS
@@ -172,6 +174,8 @@ update_node() {
     local NEED_REBOOT="${5:-0}"
     local RESULT="${6:-OK}"
     local ERRORS="${7:-}"
+    local PVEVERSION="${8:-}"
+    local REBOOT_REASON_TEXT="${9:-}"
 
     {
       echo "COUNT|$COUNT"
@@ -181,6 +185,8 @@ update_node() {
       echo "REBOOT|$NEED_REBOOT"
       echo "RESULT|$RESULT"
       echo "ERRORS|$ERRORS"
+      echo "PVEVERSION|$PVEVERSION"
+      echo "REBOOT_REASON|$REBOOT_REASON_TEXT"
     } > "$SUMMARY_FILE"
   }
 
@@ -282,19 +288,29 @@ update_node() {
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
+  PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'pveversion' 2>/dev/null)
   RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r' 2>/dev/null)
   LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
     "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1" 2>/dev/null)
 
   local NEED_REBOOT=0
+  local REBOOT_REASONS=()
+  local REBOOT_REASON_TEXT=""
 
   if [[ -n "$RKERNEL" && -n "$LKERNEL" && "$RKERNEL" != "$LKERNEL" ]]; then
     NEED_REBOOT=1
+    REBOOT_REASONS+=("kernel mismatch")
   fi
 
   remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" '[ -f /var/run/reboot-required ]' &>/dev/null
   if [ $? -eq 0 ]; then
     NEED_REBOOT=1
+    REBOOT_REASONS+=("/var/run/reboot-required")
+  fi
+
+  if [ ${#REBOOT_REASONS[@]} -gt 0 ]; then
+    printf -v REBOOT_REASON_TEXT "%s; " "${REBOOT_REASONS[@]}"
+    REBOOT_REASON_TEXT=${REBOOT_REASON_TEXT%; }
   fi
 
   local RESULT="OK"
@@ -317,7 +333,7 @@ update_node() {
   fi
 
   # ---- WRITE SUMMARY FILE ----
-  write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "$RESULT" "$ERROR_TEXT"
+  write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "$RESULT" "$ERROR_TEXT" "$PVEVERSION" "$REBOOT_REASON_TEXT"
 }
 
 # ---- DETECT CLUSTER NODES ----
@@ -492,7 +508,9 @@ for NODE in "${NODES[@]}"; do
   PKGS=""
   RK=""
   LK=""
+  PV=""
   REBOOT=0
+  REBOOT_REASON_TEXT=""
   RESULT="FAILED"
   ERRORS="No summary file was written"
 
@@ -508,6 +526,8 @@ for NODE in "${NODES[@]}"; do
         REBOOT)  REBOOT="$value" ;;
         RESULT)  RESULT="$value" ;;
         ERRORS)  ERRORS="$value" ;;
+        PVEVERSION) PV="$value" ;;
+        REBOOT_REASON) REBOOT_REASON_TEXT="$value" ;;
       esac
     done < "$SUMMARY_FILE"
   fi
@@ -516,6 +536,8 @@ for NODE in "${NODES[@]}"; do
   UPDATED_PACKAGES["$NODE"]="$PKGS"
   RUNNING_KERNEL["$NODE"]="$RK"
   LATEST_KERNEL["$NODE"]="$LK"
+  PVE_VERSION["$NODE"]="$PV"
+  REBOOT_REASON["$NODE"]="$REBOOT_REASON_TEXT"
   NODE_RESULT["$NODE"]="$RESULT"
   NODE_ERRORS["$NODE"]="$ERRORS"
 
@@ -539,7 +561,8 @@ if [ ${#REBOOT_NEEDED[@]} -eq 0 ]; then
 else
   echo -e "${YELLOW}The following nodes require a reboot:${RESET}"
   for NODE in "${REBOOT_NEEDED[@]}"; do
-    echo -e "  - ${BOLD}${NODE}${RESET}"
+    REBOOT_REASON_TEXT=${REBOOT_REASON[$NODE]:-Unknown reason}
+    echo -e "  - ${BOLD}${NODE}${RESET}: $REBOOT_REASON_TEXT"
   done
 fi
 
@@ -561,6 +584,8 @@ for NODE in "${NODES[@]}"; do
   PKGLIST=${UPDATED_PACKAGES[$NODE]}
   RK=${RUNNING_KERNEL[$NODE]}
   LK=${LATEST_KERNEL[$NODE]}
+  PV=${PVE_VERSION[$NODE]}
+  REBOOT_REASON_TEXT=${REBOOT_REASON[$NODE]}
   RESULT=${NODE_RESULT[$NODE]:-FAILED}
   ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
 
@@ -580,6 +605,12 @@ for NODE in "${NODES[@]}"; do
     echo "  Package changes: None"
   fi
 
+  if [[ -n "$PV" ]]; then
+    echo -e "  Proxmox version: ${BOLD}$PV${RESET}"
+  else
+    echo -e "  Proxmox version: ${RED}Could not be determined${RESET}"
+  fi
+
   if [[ -n "$RK" && -n "$LK" ]]; then
     echo -e "  Running kernel: ${BOLD}$RK${RESET}"
     echo -e "  Latest installed kernel: ${BOLD}$LK${RESET}"
@@ -588,6 +619,12 @@ for NODE in "${NODES[@]}"; do
     echo -e "  Latest installed kernel: ${RED}Unknown (no /boot/vmlinuz-* ?)${RESET}"
   else
     echo -e "  Kernel information: ${RED}Could not be determined${RESET}"
+  fi
+
+  if [[ -n "$REBOOT_REASON_TEXT" ]]; then
+    echo -e "  Reboot reason: ${YELLOW}$REBOOT_REASON_TEXT${RESET}"
+  else
+    echo -e "  Reboot reason: None detected"
   fi
 done
 
