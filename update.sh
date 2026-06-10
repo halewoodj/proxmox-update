@@ -159,6 +159,17 @@ print_rule() {
   printf "%b\n" "${CYAN}${LINE}${RESET}"
 }
 
+terminal_width() {
+  local WIDTH
+
+  WIDTH=$(tput cols 2>/dev/null || true)
+  if [[ ! "$WIDTH" =~ ^[0-9]+$ ]] || [ "$WIDTH" -lt 40 ]; then
+    WIDTH=80
+  fi
+
+  printf "%s" "$WIDTH"
+}
+
 print_title() {
   local TITLE="$1"
 
@@ -170,8 +181,16 @@ print_title() {
 print_meta() {
   local LABEL="$1"
   local VALUE="$2"
+  local WIDTH="${3:-14}"
 
-  printf "%b%-14s%b %s\n" "$BOLD" "$LABEL:" "$RESET" "$VALUE"
+  printf "%b%-*s%b %s\n" "$BOLD" "$WIDTH" "$LABEL:" "$RESET" "$VALUE"
+}
+
+print_node_meta() {
+  local LABEL="$1"
+  local VALUE="$2"
+
+  print_meta "  $LABEL" "$VALUE" 16
 }
 
 repeat_char() {
@@ -618,6 +637,7 @@ done
 
 # ---- SUMMARY ----
 clear
+RULE_WIDTH=$(terminal_width)
 print_title "Update Summary"
 print_meta "Mode" "$RUN_MODE"
 print_meta "Nodes" "${#NODES[@]} processed"
@@ -626,9 +646,9 @@ print_meta "Reboots" "${#REBOOT_NEEDED[@]}"
 echo
 
 if [ ${#REBOOT_NEEDED[@]} -eq 0 ]; then
-  echo -e "${GREEN}${BOLD}Reboots:${RESET} none required"
+  print_meta "Reboots" "${GREEN}none required${RESET}"
 else
-  echo -e "${YELLOW}${BOLD}Reboots required:${RESET}"
+  print_meta "Reboots" "${YELLOW}required${RESET}"
   for NODE in "${REBOOT_NEEDED[@]}"; do
     REBOOT_REASON_TEXT=${REBOOT_REASON[$NODE]:-Unknown reason}
     echo -e "  - ${BOLD}${NODE}${RESET}: $REBOOT_REASON_TEXT"
@@ -637,9 +657,9 @@ fi
 
 echo
 if [ ${#FAILED_NODES[@]} -eq 0 ]; then
-  echo -e "${GREEN}${BOLD}Failures:${RESET} none reported"
+  print_meta "Failures" "${GREEN}none reported${RESET}"
 else
-  echo -e "${RED}${BOLD}Failures reported:${RESET}"
+  print_meta "Failures" "${RED}reported${RESET}"
   for NODE in "${FAILED_NODES[@]}"; do
     ERROR_TEXT=${NODE_ERRORS[$NODE]:-Unknown failure}
     echo -e "  - ${BOLD}${NODE}${RESET}: $ERROR_TEXT"
@@ -663,37 +683,37 @@ for NODE in "${NODES[@]}"; do
   echo
   echo -e "${CYAN}${BOLD}$NODE${RESET}"
   if [ "$RESULT" = "OK" ]; then
-    print_meta "  Result" "${GREEN}OK${RESET}"
+    print_node_meta "Result" "${GREEN}OK${RESET}"
   else
-    print_meta "  Result" "${RED}FAILED${RESET}"
-    print_meta "  Errors" "$ERROR_TEXT"
+    print_node_meta "Result" "${RED}FAILED${RESET}"
+    print_node_meta "Errors" "$ERROR_TEXT"
   fi
-  print_meta "  Changes" "${BOLD}$COUNT${RESET}"
+  print_node_meta "Changes" "${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
-    print_meta "  Packages" ""
+    print_node_meta "Packages" ""
     echo "    $PKGLIST" | fmt -w 70 | sed 's/^/    /'
   else
-    print_meta "  Packages" "None"
+    print_node_meta "Packages" "None"
   fi
 
   if [[ -n "$PV" ]]; then
-    print_meta "  PVE" "${BOLD}$PV${RESET}"
+    print_node_meta "PVE" "${BOLD}$PV${RESET}"
   else
-    print_meta "  PVE" "${RED}Could not be determined${RESET}"
+    print_node_meta "PVE" "${RED}Could not be determined${RESET}"
   fi
 
   if [[ -n "$RK" && -n "$LK" ]]; then
-    print_meta "  Kernel" "running ${BOLD}$RK${RESET}, latest ${BOLD}$LK${RESET}"
+    print_node_meta "Kernel" "running ${BOLD}$RK${RESET}, latest ${BOLD}$LK${RESET}"
   elif [[ -n "$RK" ]]; then
-    print_meta "  Kernel" "running ${BOLD}$RK${RESET}, latest ${RED}unknown${RESET}"
+    print_node_meta "Kernel" "running ${BOLD}$RK${RESET}, latest ${RED}unknown${RESET}"
   else
-    print_meta "  Kernel" "${RED}Could not be determined${RESET}"
+    print_node_meta "Kernel" "${RED}Could not be determined${RESET}"
   fi
 
   if [[ -n "$REBOOT_REASON_TEXT" ]]; then
-    print_meta "  Reboot" "${YELLOW}$REBOOT_REASON_TEXT${RESET}"
+    print_node_meta "Reboot" "${YELLOW}$REBOOT_REASON_TEXT${RESET}"
   else
-    print_meta "  Reboot" "None detected"
+    print_node_meta "Reboot" "None detected"
   fi
 done
 
