@@ -92,7 +92,9 @@ The script updates one node at a time unless you pass `--jobs` or `--parallel`. 
 
 The script uses `apt-get -y dist-upgrade`, following Proxmox's documented CLI update path. Package prompts are answered automatically where possible, but repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
 
-SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. These settings do not forcibly terminate a remote package command that is still running but waiting internally.
+Package commands run with `DEBIAN_FRONTEND=noninteractive` and dpkg options that keep existing config files when a package asks how to handle a changed config file.
+
+SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. Remote commands are also wrapped with `timeout`: quick checks use 120 seconds, package update and maintenance steps use 1800 seconds, and `dist-upgrade` uses 7200 seconds.
 
 If `apt-get update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `dist-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
 
@@ -103,8 +105,6 @@ The package change list in the final summary comes from the pre-upgrade simulati
 ## Suggested Improvements
 
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
-- Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
-- Add a remote command timeout for package-management commands that are still connected but waiting indefinitely.
 
 ## Safety Checklist
 

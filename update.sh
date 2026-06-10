@@ -42,6 +42,12 @@ MAX_PARALLEL=1
 DRY_RUN=0
 ONLY_NODES=()
 EXCLUDE_NODES=()
+REMOTE_CHECK_TIMEOUT=120
+APT_UPDATE_TIMEOUT=1800
+APT_UPGRADE_TIMEOUT=7200
+APT_MAINT_TIMEOUT=1800
+APT_ENV="DEBIAN_FRONTEND=noninteractive"
+APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -135,6 +141,14 @@ list_contains() {
   return 1
 }
 
+remote_run() {
+  local NODE="$1"
+  local TIMEOUT_SECONDS="$2"
+  local COMMAND="$3"
+
+  ssh "${SSH_OPTS[@]}" root@"$NODE" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
+}
+
 update_node() {
   local NODE="$1"
   local STATUS_FILE="$2"
@@ -173,7 +187,7 @@ update_node() {
   node_status "${CYAN}Initializing...${RESET}"
 
   # Quick SSH check
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'true' &>/dev/null
+  remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'true' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}SSH connection failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "SSH connection failed"
@@ -184,7 +198,7 @@ update_node() {
 
   # ---- STEP 1: apt-get update ----
   node_status "${CYAN}Running apt-get update...${RESET}"
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get update' &>/dev/null
+  remote_run "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get update" &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}apt-get update failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
@@ -195,7 +209,7 @@ update_node() {
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -s dist-upgrade' 2>/dev/null)
+  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get -s dist-upgrade" 2>/dev/null)
   if [ $? -ne 0 ]; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
@@ -231,7 +245,7 @@ update_node() {
 
   # ---- STEP 2: dist-upgrade ----
   if [ "$COUNT" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y dist-upgrade' &>/dev/null
+    remote_run "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y dist-upgrade" &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "dist-upgrade failed"
@@ -244,7 +258,7 @@ update_node() {
   # ---- STEP 3: autoremove ----
   if [ "$DRY_RUN" -eq 0 ]; then
     node_status "${CYAN}Removing unused packages...${RESET}"
-    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -y autoremove' &>/dev/null
+    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y autoremove" &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}autoremove failed${RESET}"
       ERRORS+=("autoremove failed")
@@ -256,7 +270,7 @@ update_node() {
   # ---- STEP 4: clean ----
   if [ "$DRY_RUN" -eq 0 ]; then
     node_status "${CYAN}Cleaning package cache...${RESET}"
-    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get clean' &>/dev/null
+    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get clean" &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}apt-get clean failed${RESET}"
       ERRORS+=("apt-get clean failed")
@@ -268,8 +282,8 @@ update_node() {
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
-  RKERNEL=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'uname -r' 2>/dev/null)
-  LKERNEL=$(ssh "${SSH_OPTS[@]}" root@"$NODE" \
+  RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r' 2>/dev/null)
+  LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
     "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1" 2>/dev/null)
 
   local NEED_REBOOT=0
@@ -278,7 +292,7 @@ update_node() {
     NEED_REBOOT=1
   fi
 
-  ssh "${SSH_OPTS[@]}" root@"$NODE" '[ -f /var/run/reboot-required ]' &>/dev/null
+  remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" '[ -f /var/run/reboot-required ]' &>/dev/null
   if [ $? -eq 0 ]; then
     NEED_REBOOT=1
   fi
