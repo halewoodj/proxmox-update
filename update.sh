@@ -22,6 +22,13 @@ RESET='\033[0m'
 
 # ---- ARRAYS / VARIABLES ----
 REBOOT_NEEDED=()
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=10
+  -o ConnectionAttempts=1
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
+)
 
 declare -A UPDATED_PACKAGES
 declare -A UPDATED_COUNT
@@ -31,6 +38,12 @@ declare -A NODE_PIDS
 
 # ---- CLEAR SCREEN AT START ----
 clear
+
+# ---- REQUIRE ROOT ----
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}Error: this script must be run as root.${RESET}"
+  exit 1
+fi
 
 # ---- FUNCTIONS ----
 update_node() {
@@ -46,7 +59,7 @@ update_node() {
   node_status "${CYAN}Initializing...${RESET}"
 
   # Quick SSH check
-  ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$NODE" 'true' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'true' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}SSH connection failed${RESET}"
     {
@@ -61,7 +74,7 @@ update_node() {
 
   # ---- STEP 1: apt update ----
   node_status "${CYAN}Running apt update...${RESET}"
-  ssh -o BatchMode=yes root@"$NODE" 'apt update' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt update' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}apt update failed${RESET}"
     # Continue anyway, but note that upgrades may not be accurate
@@ -71,7 +84,7 @@ update_node() {
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(ssh -o BatchMode=yes root@"$NODE" 'apt-get -s full-upgrade' 2>/dev/null)
+  UPGRADE_SIM=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt-get -s full-upgrade' 2>/dev/null)
 
   PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '
     /The following packages will be upgraded:/ {flag=1; next}
@@ -92,7 +105,7 @@ update_node() {
 
   # ---- STEP 2: full-upgrade ----
   if [ "$COUNT" -gt 0 ]; then
-    ssh -o BatchMode=yes root@"$NODE" 'apt -y full-upgrade' &>/dev/null
+    ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y full-upgrade' &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
     else
@@ -102,7 +115,7 @@ update_node() {
 
   # ---- STEP 3: autoremove ----
   node_status "${CYAN}Removing unused packages...${RESET}"
-  ssh -o BatchMode=yes root@"$NODE" 'apt -y autoremove' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt -y autoremove' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}autoremove failed${RESET}"
   else
@@ -111,7 +124,7 @@ update_node() {
 
   # ---- STEP 4: clean ----
   node_status "${CYAN}Cleaning package cache...${RESET}"
-  ssh -o BatchMode=yes root@"$NODE" 'apt clean' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" 'apt clean' &>/dev/null
   if [ $? -ne 0 ]; then
     node_status "${RED}apt clean failed${RESET}"
   else
@@ -121,8 +134,8 @@ update_node() {
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
-  RKERNEL=$(ssh -o BatchMode=yes root@"$NODE" 'uname -r' 2>/dev/null)
-  LKERNEL=$(ssh -o BatchMode=yes root@"$NODE" \
+  RKERNEL=$(ssh "${SSH_OPTS[@]}" root@"$NODE" 'uname -r' 2>/dev/null)
+  LKERNEL=$(ssh "${SSH_OPTS[@]}" root@"$NODE" \
     "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1" 2>/dev/null)
 
   local NEED_REBOOT=0
@@ -131,7 +144,7 @@ update_node() {
     NEED_REBOOT=1
   fi
 
-  ssh -o BatchMode=yes root@"$NODE" '[ -f /var/run/reboot-required ]' &>/dev/null
+  ssh "${SSH_OPTS[@]}" root@"$NODE" '[ -f /var/run/reboot-required ]' &>/dev/null
   if [ $? -eq 0 ]; then
     NEED_REBOOT=1
   fi

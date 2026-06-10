@@ -53,17 +53,18 @@ The script runs updates on all detected nodes in parallel. This is convenient, b
 
 The script uses `apt -y full-upgrade`, so package prompts are answered automatically where possible. Repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
 
+SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. These settings do not forcibly terminate a remote package command that is still running but waiting internally.
+
 The package list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 ## Suggested Improvements
 
 - Add a serial mode, or a configurable concurrency limit, so production clusters can update one node at a time.
 - Add a dry-run mode that only performs SSH checks, `apt update`, upgrade simulation, and reboot detection.
-- Add a root-user check before any cluster work starts.
 - Record detailed per-node logs instead of discarding command output with `&>/dev/null`.
 - Stop the update flow for a node if `apt update` fails, because the later upgrade simulation may be stale or misleading.
 - Use `DEBIAN_FRONTEND=noninteractive` and explicit `apt-get` options for more predictable unattended upgrades.
-- Add timeout options to all SSH package-management commands, not just the initial connection test.
+- Add a remote command timeout for package-management commands that are still connected but waiting indefinitely.
 - Detect and report failed nodes separately in the final summary.
 - Add an option to exclude specific nodes or target only selected nodes.
 
