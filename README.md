@@ -1,6 +1,8 @@
-# Proxmox Cluster Update Script
+# Proxmox Cluster Maintenance Scripts
 
 `update.sh` is a Bash helper for updating every node in a Proxmox VE cluster from a single Proxmox node.
+
+`rolling-reboot.sh` is a Bash helper for safely rebooting Proxmox VE cluster nodes one at a time after evacuating guests and checking cluster/Ceph health.
 
 It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, runs package maintenance with configurable concurrency, displays a live status table, and prints a final per-node summary with package and kernel information.
 
@@ -88,6 +90,75 @@ You can combine these options:
 
 The script does not reboot nodes automatically. If the final summary reports that one or more nodes require a reboot, reboot them manually in a controlled order that is appropriate for your cluster workloads.
 
+## Rolling Reboots
+
+Review the script before running it:
+
+```bash
+less rolling-reboot.sh
+```
+
+Make it executable:
+
+```bash
+chmod +x rolling-reboot.sh
+```
+
+Run a dry run first:
+
+```bash
+./rolling-reboot.sh --dry-run
+```
+
+Run the rolling reboot from a Proxmox VE cluster node:
+
+```bash
+./rolling-reboot.sh
+```
+
+The script reboots one selected node at a time. Before each reboot it:
+
+- Confirms cluster quorum is healthy.
+- Confirms Ceph reports `HEALTH_OK`.
+- Migrates VMs and containers away from the node.
+- Verifies no selected-scope guests remain on that node.
+- Reboots the node.
+- Waits for the node, Proxmox services, quorum, and Ceph `HEALTH_OK` to recover before continuing.
+
+By default, `rolling-reboot.sh` migrates all VMs/CTs it finds on each node, including stopped guests. To drain only running workloads, use:
+
+```bash
+./rolling-reboot.sh --running-only
+```
+
+To reboot only specific nodes, use:
+
+```bash
+./rolling-reboot.sh --nodes pve1,pve3
+```
+
+To exclude nodes from rebooting, use:
+
+```bash
+./rolling-reboot.sh --exclude pve2
+```
+
+For guests on local storage, default migration commands may fail. The script stops instead of rebooting if a guest cannot be migrated. If your cluster needs explicit migration options, you can pass a target storage name:
+
+```bash
+./rolling-reboot.sh --target-storage local-zfs
+```
+
+For QEMU guests that require local disk migration, you can also pass:
+
+```bash
+./rolling-reboot.sh --qm-with-local-disks
+```
+
+If the node running the script is selected for reboot, it is moved to the end of the order. After it is evacuated and its reboot is scheduled, the script exits because its own host is rebooting.
+
+`rolling-reboot.sh` does not migrate guests back to their original nodes after the rolling reboot. It leaves guests where the successful migration commands placed them.
+
 ## Important Notes
 
 The script updates one node at a time unless you pass `--jobs` or `--parallel`. Increasing concurrency can be useful in lab clusters or planned maintenance windows, but it may be risky for production clusters if multiple nodes host critical guests, storage services, or quorum-sensitive workloads.
@@ -105,6 +176,10 @@ In dry-run mode, the script still runs `apt-get update`, upgrade simulation, and
 The package change list in the final summary comes from the pre-upgrade simulation. If the real upgrade behaves differently because repositories change, packages are held, or dependency resolution changes during execution, the summary may not perfectly match what was installed.
 
 Reboot reasons are reported as `kernel mismatch`, `/var/run/reboot-required`, or both.
+
+For rolling reboots, the Ceph gate requires `ceph health` to begin with `HEALTH_OK` before a node is rebooted and after each remote node returns. Clusters with persistent Ceph warnings will intentionally block until the warning is fixed or until you explicitly run with `--skip-ceph-check`.
+
+Migration target selection is automatic. For each guest, the reboot script tries available cluster nodes in order of lowest current guest count and stops if the guest cannot be moved away from the node being rebooted.
 
 ## Suggested Improvements
 
@@ -127,4 +202,5 @@ The script has been checked for Bash syntax with:
 
 ```bash
 bash -n update.sh
+bash -n rolling-reboot.sh
 ```
