@@ -28,6 +28,8 @@ Options:
   -j, --jobs N      Number of nodes to update at once (default: 1)
   -p, --parallel    Update all detected nodes at once
   -n, --dry-run     Check updates and reboot status without changing packages
+      --cluster-host HOST
+                    Discover the cluster through a remote Proxmox node
       --nodes LIST  Only process comma-separated node names
       --exclude LIST
                     Exclude comma-separated node names
@@ -40,6 +42,7 @@ REBOOT_NEEDED=()
 FAILED_NODES=()
 MAX_PARALLEL=1
 DRY_RUN=0
+CLUSTER_HOST=""
 ONLY_NODES=()
 EXCLUDE_NODES=()
 REMOTE_CHECK_TIMEOUT=120
@@ -74,6 +77,15 @@ while [ "$#" -gt 0 ]; do
     -n|--dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --cluster-host)
+      if [ -z "${2:-}" ]; then
+        echo "Error: --cluster-host requires a host name or user@host target." >&2
+        exit 1
+      fi
+      CLUSTER_HOST="$2"
+      [[ "$CLUSTER_HOST" == *@* ]] || CLUSTER_HOST="root@$CLUSTER_HOST"
+      shift 2
       ;;
     --nodes)
       if [ -z "${2:-}" ]; then
@@ -121,10 +133,11 @@ declare -A NODE_STARTED
 declare -A NODE_DONE
 
 # ---- CLEAR SCREEN AT START ----
-clear
+clear_screen() { if [ -t 1 ]; then clear; fi; }
+clear_screen
 
 # ---- REQUIRE ROOT ----
-if [ "$EUID" -ne 0 ]; then
+if [ -z "$CLUSTER_HOST" ] && [ "$EUID" -ne 0 ]; then
   echo -e "${RED}Error: this script must be run as root.${RESET}"
   exit 1
 fi
@@ -141,6 +154,14 @@ list_contains() {
   done
 
   return 1
+}
+
+cluster_run() {
+  if [ -n "$CLUSTER_HOST" ]; then
+    ssh "${SSH_OPTS[@]}" "$CLUSTER_HOST" "timeout --preserve-status ${REMOTE_CHECK_TIMEOUT}s pvecm nodes"
+  else
+    pvecm nodes
+  fi
 }
 
 remote_run() {
@@ -222,7 +243,7 @@ update_node() {
     local LKERNEL="${4:-}"
     local NEED_REBOOT="${5:-0}"
     local RESULT="${6:-OK}"
-    local ERRORS="${7:-}"
+    local UPDATE_ERRORS="${7:-}"
     local PVEVERSION="${8:-}"
     local REBOOT_REASON_TEXT="${9:-}"
 
@@ -233,7 +254,7 @@ update_node() {
       echo "LKERNEL|$LKERNEL"
       echo "REBOOT|$NEED_REBOOT"
       echo "RESULT|$RESULT"
-      echo "ERRORS|$ERRORS"
+      echo "ERRORS|$UPDATE_ERRORS"
       echo "PVEVERSION|$PVEVERSION"
       echo "REBOOT_REASON|$REBOOT_REASON_TEXT"
     } > "$SUMMARY_FILE"
@@ -249,7 +270,7 @@ update_node() {
     return
   fi
 
-  local ERRORS=()
+  local UPDATE_ERRORS=()
 
   # ---- STEP 1: apt-get update ----
   node_status "${CYAN}Running apt-get update...${RESET}"
@@ -316,7 +337,7 @@ update_node() {
     remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y autoremove" &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}autoremove failed${RESET}"
-      ERRORS+=("autoremove failed")
+      UPDATE_ERRORS+=("autoremove failed")
     else
       node_status "${GREEN}autoremove complete${RESET}"
     fi
@@ -328,7 +349,7 @@ update_node() {
     remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get clean" &>/dev/null
     if [ $? -ne 0 ]; then
       node_status "${RED}apt-get clean failed${RESET}"
-      ERRORS+=("apt-get clean failed")
+      UPDATE_ERRORS+=("apt-get clean failed")
     else
       node_status "${GREEN}apt-get clean complete${RESET}"
     fi
@@ -365,9 +386,9 @@ update_node() {
   local RESULT="OK"
   local ERROR_TEXT=""
 
-  if [ ${#ERRORS[@]} -gt 0 ]; then
+  if [ ${#UPDATE_ERRORS[@]} -gt 0 ]; then
     RESULT="FAILED"
-    printf -v ERROR_TEXT "%s; " "${ERRORS[@]}"
+    printf -v ERROR_TEXT "%s; " "${UPDATE_ERRORS[@]}"
     ERROR_TEXT=${ERROR_TEXT%; }
   fi
 
@@ -388,7 +409,7 @@ update_node() {
 # ---- DETECT CLUSTER NODES ----
 echo -e "${CYAN}${BOLD}Detecting Proxmox cluster nodes...${RESET}"
 
-if ! command -v pvecm >/dev/null 2>&1; then
+if [ -z "$CLUSTER_HOST" ] && ! command -v pvecm >/dev/null 2>&1; then
   echo -e "${RED}Error: 'pvecm' command not found. Are you running this on a Proxmox node?${RESET}"
   exit 1
 fi
@@ -400,8 +421,12 @@ fi
 # 1           1     NODE-1 (local)
 # 2           1     NODE-2
 # ...
+if ! CLUSTER_NODES=$(cluster_run); then
+  echo "Error: could not discover cluster nodes." >&2
+  exit 1
+fi
 mapfile -t NODES < <(
-  pvecm nodes | awk '
+  printf '%s\n' "$CLUSTER_NODES" | awk '
     $1 ~ /^[0-9]+$/ && NF >= 3 {print $3}
   '
 )
@@ -481,7 +506,7 @@ STATE_COL_WIDTH=8
 STATUS_COL_WIDTH=44
 RULE_WIDTH=$((NODE_COL_WIDTH + 2 + STATE_COL_WIDTH + 2 + STATUS_COL_WIDTH))
 
-clear
+clear_screen
 print_title "Proxmox VE Cluster Update"
 print_meta "Mode" "$RUN_MODE"
 print_meta "Detected" "${DETECTED_NODES[*]}"
@@ -509,6 +534,8 @@ for NODE in "${NODES[@]}"; do
   NODE_STARTED["$NODE"]=0
   NODE_DONE["$NODE"]=0
 done
+
+declare -A NODE_LAST_STATUS
 
 # ---- LIVE DASHBOARD LOOP ----
 while :; do
@@ -546,7 +573,8 @@ while :; do
     fi
   done
 
-  clear
+  if [ -t 1 ]; then
+  clear_screen
   print_title "Proxmox VE Cluster Update"
   print_meta "Mode" "$RUN_MODE"
   print_meta "Concurrency" "$MAX_PARALLEL node(s) at a time"
@@ -578,6 +606,15 @@ while :; do
 
   echo
   print_rule
+  else
+    for NODE in "${NODES[@]}"; do
+      STATUS_LINE=$(tail -n1 "$TMP_DIR/$NODE.status")
+      if [ "${NODE_LAST_STATUS[$NODE]:-}" != "$STATUS_LINE" ]; then
+        printf '[%s] %b\n' "$NODE" "$STATUS_LINE"
+        NODE_LAST_STATUS["$NODE"]="$STATUS_LINE"
+      fi
+    done
+  fi
   [ "$completed_count" -eq "${#NODES[@]}" ] && break
   sleep 0.5
 done
@@ -636,7 +673,7 @@ for NODE in "${NODES[@]}"; do
 done
 
 # ---- SUMMARY ----
-clear
+clear_screen
 RULE_WIDTH=$(terminal_width)
 print_title "Update Summary"
 print_meta "Mode" "$RUN_MODE"
@@ -721,3 +758,8 @@ echo
 print_rule
 echo -e "${BOLD}All nodes processed.${RESET}"
 print_rule
+
+# Automation must receive a failure when any node's package maintenance failed.
+if [ "${#FAILED_NODES[@]}" -gt 0 ]; then
+  exit 1
+fi
