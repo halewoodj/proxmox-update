@@ -25,8 +25,8 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  -j, --jobs N      Number of nodes to update at once (default: 1)
-  -p, --parallel    Update all detected nodes at once
+  -j, --jobs N      Preview concurrency; apply requires 1 (default: 1)
+  -p, --parallel    Preview all detected nodes at once
   -n, --dry-run     Check updates and reboot status without changing packages
       --cluster-host HOST
                     Discover the cluster through a remote Proxmox node
@@ -115,6 +115,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$DRY_RUN" -eq 0 ] && [ "$MAX_PARALLEL" -ne 1 ]; then
+  echo "Error: applying cluster updates requires --jobs 1." >&2
+  exit 1
+fi
+
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo -e "${RED}Error: this script requires Bash 4 or newer.${RESET}"
   exit 1
@@ -170,6 +175,24 @@ remote_run() {
   local COMMAND="$3"
 
   ssh "${SSH_OPTS[@]}" root@"$NODE" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
+}
+
+# Check the whole detected cluster between nodes, including previously updated nodes.
+# The helper is read-only and refuses an armed HA node; it does not disable fencing.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cluster_gate() {
+  python3 "$SCRIPT_DIR/semaphore/update_guard.py" --nodes "$(IFS=,; echo "${DETECTED_NODES[*]}")" --state "$TMP_DIR/boot-ids.json" "$@"
+}
+
+remote_logged() {
+  local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" LABEL="$4" RC
+  remote_run "$NODE" "$TIMEOUT_SECONDS" "$COMMAND" >> "$TMP_DIR/$NODE.log" 2>&1
+  RC=$?
+  if [ "$RC" -ne 0 ]; then
+    printf '[%s] %s failed (exit %s). Last output:\n' "$NODE" "$LABEL" "$RC" >&2
+    tail -n 60 "$TMP_DIR/$NODE.log" >&2
+  fi
+  return "$RC"
 }
 
 print_rule() {
@@ -267,29 +290,30 @@ update_node() {
   if [ $? -ne 0 ]; then
     node_status "${RED}SSH connection failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "SSH connection failed"
-    return
+    return 1
   fi
 
   local UPDATE_ERRORS=()
 
   # ---- STEP 1: apt-get update ----
   node_status "${CYAN}Running apt-get update...${RESET}"
-  remote_run "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get update" &>/dev/null
+  remote_logged "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get -o APT::Update::Error-Mode=any update" "apt-get update"
   if [ $? -ne 0 ]; then
     node_status "${RED}apt-get update failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
-    return
+    return 1
   else
     node_status "${GREEN}apt-get update complete${RESET}"
   fi
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get -s dist-upgrade" 2>/dev/null)
+  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get -s dist-upgrade" 2> "$TMP_DIR/$NODE.simulation.log")
   if [ $? -ne 0 ]; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
-    return
+    cat "$TMP_DIR/$NODE.simulation.log" >&2
+    return 1
   fi
 
   INST_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Inst / {printf "%s ", $2}' | sed 's/ *$//')
@@ -321,47 +345,48 @@ update_node() {
 
   # ---- STEP 2: dist-upgrade ----
   if [ "$COUNT" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    remote_run "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y dist-upgrade" &>/dev/null
+    if [ -n "$REMV_PKGS" ]; then
+      node_status "${RED}Package removals require review${RESET}"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "simulation includes package removals"
+      return 1
+    fi
+    # Recheck immediately before mutation, after metadata refresh and simulation.
+    if ! cluster_gate --target "$NODE" --apply; then
+      node_status "${RED}Safety gate failed${RESET}"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "node is not safe for package changes"
+      return 1
+    fi
+    remote_logged "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y --no-remove dist-upgrade" "dist-upgrade"
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "dist-upgrade failed"
-      return
+      return 1
     fi
 
     node_status "${GREEN}Upgrade complete${RESET}"
   fi
 
-  # ---- STEP 3: autoremove ----
-  if [ "$DRY_RUN" -eq 0 ]; then
-    node_status "${CYAN}Removing unused packages...${RESET}"
-    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y autoremove" &>/dev/null
-    if [ $? -ne 0 ]; then
-      node_status "${RED}autoremove failed${RESET}"
-      UPDATE_ERRORS+=("autoremove failed")
-    else
-      node_status "${GREEN}autoremove complete${RESET}"
-    fi
-  fi
+  # Keep package caches and old kernels for diagnosis/recovery. Cleanup is separate.
 
-  # ---- STEP 4: clean ----
-  if [ "$DRY_RUN" -eq 0 ]; then
-    node_status "${CYAN}Cleaning package cache...${RESET}"
-    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get clean" &>/dev/null
-    if [ $? -ne 0 ]; then
-      node_status "${RED}apt-get clean failed${RESET}"
-      UPDATE_ERRORS+=("apt-get clean failed")
-    else
-      node_status "${GREEN}apt-get clean complete${RESET}"
-    fi
+  local GUARD_ARGS=(--target "$NODE")
+  if [ "$DRY_RUN" -eq 0 ] && [ "$COUNT" -gt 0 ]; then GUARD_ARGS+=(--apply); fi
+  if ! cluster_gate "${GUARD_ARGS[@]}"; then
+    node_status "${RED}Post-update health check failed${RESET}"
+    write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "post-update cluster/package health check failed"
+    return 1
   fi
 
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
-  PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'pveversion' 2>/dev/null)
-  RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r' 2>/dev/null)
-  LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
-    "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1" 2>/dev/null)
+  if ! PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'pveversion') || [ -z "$PVEVERSION" ] ||
+     ! RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r') || [ -z "$RKERNEL" ] ||
+     ! LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
+       "set -o pipefail; ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -n1") || [ -z "$LKERNEL" ]; then
+    node_status "${RED}Version/kernel verification failed${RESET}"
+    write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "version/kernel verification failed"
+    return 1
+  fi
 
   local NEED_REBOOT=0
   local REBOOT_REASONS=()
@@ -404,6 +429,7 @@ update_node() {
 
   # ---- WRITE SUMMARY FILE ----
   write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "$RESULT" "$ERROR_TEXT" "$PVEVERSION" "$REBOOT_REASON_TEXT"
+  [ "$RESULT" = "OK" ]
 }
 
 # ---- DETECT CLUSTER NODES ----
@@ -522,7 +548,16 @@ TMP_DIR=$(mktemp -d /tmp/proxmox-update.XXXXXX) || {
   echo -e "${RED}Failed to create temporary directory.${RESET}"
   exit 1
 }
-trap 'rm -rf "$TMP_DIR"' EXIT
+chmod 700 "$TMP_DIR"
+printf 'Diagnostic logs and summaries: %s\n' "$TMP_DIR"
+# Keep logs on failure and success; they contain no SSH keys. Do not unlink while
+# package workers are still running if the controller receives a stop signal.
+trap 'echo "Controller interrupted; no further nodes will start. Check remote APT before retrying." >&2; exit 130' INT TERM HUP
+
+if ! cluster_gate; then
+  echo "Initial health check failed; no node jobs started." >&2
+  exit 1
+fi
 
 # ---- START UPDATES ----
 echo
@@ -536,6 +571,7 @@ for NODE in "${NODES[@]}"; do
 done
 
 declare -A NODE_LAST_STATUS
+STOP_NEW_JOBS=0
 
 # ---- LIVE DASHBOARD LOOP ----
 while :; do
@@ -548,7 +584,11 @@ while :; do
       if kill -0 "$pid" 2>/dev/null; then
         running_count=$((running_count + 1))
       else
-        wait "$pid" 2>/dev/null
+        if ! wait "$pid"; then STOP_NEW_JOBS=1; fi
+        if ! [ -f "$TMP_DIR/$NODE.summary" ] ||
+           ! grep -q '^RESULT|OK$' "$TMP_DIR/$NODE.summary"; then
+          STOP_NEW_JOBS=1
+        fi
         NODE_DONE["$NODE"]=1
       fi
     fi
@@ -558,7 +598,20 @@ while :; do
     fi
   done
 
+  if [ "$STOP_NEW_JOBS" -eq 1 ]; then
+    for NODE in "${NODES[@]}"; do
+      if [ "${NODE_STARTED[$NODE]}" = "0" ]; then
+        printf 'Skipped after an earlier node failed\n' > "$TMP_DIR/$NODE.status"
+        printf 'RESULT|SKIPPED\nERRORS|Stopped after an earlier node failed\n' > "$TMP_DIR/$NODE.summary"
+        NODE_STARTED["$NODE"]=1
+        NODE_DONE["$NODE"]=1
+        completed_count=$((completed_count + 1))
+      fi
+    done
+  fi
+
   for NODE in "${NODES[@]}"; do
+    [ "$STOP_NEW_JOBS" -eq 1 ] && break
     if [ "$running_count" -ge "$MAX_PARALLEL" ]; then
       break
     fi
@@ -728,7 +781,7 @@ for NODE in "${NODES[@]}"; do
   print_node_meta "Changes" "${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
     print_node_meta "Packages" ""
-    echo "    $PKGLIST" | fmt -w 70 | sed 's/^/    /'
+    printf '    %s\n' "$PKGLIST"
   else
     print_node_meta "Packages" "None"
   fi

@@ -4,20 +4,23 @@
 
 `rolling-reboot.sh` is a Bash helper for safely rebooting Proxmox VE cluster nodes one at a time after evacuating guests and checking cluster/Ceph health.
 
-It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, runs package maintenance with configurable concurrency, displays a live status table, and prints a final per-node summary with package and kernel information.
+It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, runs package maintenance one node at a time, displays a live status table, and prints a final per-node summary with package and kernel information.
 
 ## What It Does
 
 - Detects Proxmox VE cluster nodes automatically.
 - Verifies SSH access to each node before updating it.
-- Updates one node at a time by default.
+- Applies updates one node at a time; parallel apply is refused.
+- Stops the queue on the first node failure or missing worker summary.
+- Checks every cluster member, quorum, Ceph, package state and unchanged boot IDs at each boundary.
+- Refuses package installation on nodes with running guests, an active CRM, or an armed LRM watchdog.
 - Supports dry-run checks without applying package changes.
 - Supports selecting or excluding specific nodes.
 - Runs `apt-get update`.
 - Simulates `apt-get dist-upgrade` to list packages expected to be installed, upgraded, or removed.
-- Runs `apt-get -y dist-upgrade` when package changes are available.
-- Runs `apt-get -y autoremove`.
-- Runs `apt-get clean`.
+- Runs `apt-get -y --no-remove dist-upgrade` when package changes are available.
+- Retains package caches and old kernels for recovery; cleanup is a separate operation.
+- Keeps private per-node diagnostic logs and prints the failing command’s final output.
 - Reports the Proxmox VE version for each node.
 - Checks whether a reboot is likely required by comparing the running kernel with the latest installed kernel and checking `/var/run/reboot-required`.
 - Reports the reason a reboot is needed when detected.
@@ -52,17 +55,8 @@ Run it as root from a Proxmox VE cluster node:
 ./update.sh
 ```
 
-By default, the script updates one node at a time. To update more than one node at once, set an explicit job count:
-
-```bash
-./update.sh --jobs 2
-```
-
-To update all detected nodes at once, use:
-
-```bash
-./update.sh --parallel
-```
+Package installation always runs one node at a time. `--jobs 2` and `--parallel`
+are available only with `--dry-run`.
 
 To check available package changes and reboot status without applying package changes, use:
 
@@ -98,7 +92,44 @@ You can combine these options:
 ./update.sh --dry-run --nodes pve1,pve3 --jobs 2
 ```
 
-The script does not reboot nodes automatically. If the final summary reports that one or more nodes require a reboot, reboot them manually in a controlled order that is appropriate for your cluster workloads.
+The script does not initiate reboots. An active HA watchdog can still reset an
+unsafe host, so apply now requires the maintenance conditions below. Unexpected
+boot-ID changes stop the queue even when cluster health has already recovered.
+
+### Preparing a node for package installation
+
+Apply is fail-closed. It does **not** evacuate guests, change HA settings, stop
+services, or release watchdogs on the operator’s behalf. Preview remains usable
+on active nodes. Use `--nodes <prepared-node>` for each installation window.
+
+Before apply, prepare one node at a time:
+
+1. Enable its HA node maintenance with
+   `ha-manager crm-command node-maintenance enable <node>`. Review migration
+   constraints and capacity first; container migration can involve a restart.
+2. Wait for all HA migrations and workers to finish and the LRM watchdog to be
+   released. The word `maintenance` alone is insufficient. Evacuate remaining
+   non-HA guests as well.
+3. Gracefully stop that node’s CRM with `systemctl stop pve-ha-crm`, verify a
+   healthy CRM is active on another node, then keep the stopped service from
+   being restarted by package triggers with
+   `systemctl mask --runtime pve-ha-crm`. Never kill HA daemons or watchdog-mux.
+4. Run apply for the prepared node. The guard checks the entire detected cluster,
+   including nodes excluded from package installation. It also requires all Ceph
+   OSDs up/in, every placement group active+clean, fresh HA heartbeats, and no
+   incomplete/locked package database on any node. APT package removals require
+   separate review and are refused.
+5. After a successful update and health checks, remove only the runtime mask you
+   introduced (`systemctl unmask --runtime pve-ha-crm`), start the CRM, verify HA,
+   then disable node maintenance to allow HA guests to return. Preserve any
+   pre-existing masks/maintenance settings. Handle a required reboot separately.
+
+On failure, leave the node prepared for maintenance and investigate using the
+printed diagnostic directory. Do not retry while any remote APT/dpkg operation
+is still active. The updater never disarms HA cluster-wide.
+
+The checks reduce the risks seen in the incident; they do not establish why an
+HA process previously stopped responding or prove that a future package is safe.
 
 ## Rolling Reboots
 
@@ -247,8 +278,10 @@ key to the Semaphore controller's source IP and disable forwarding and PTY acces
 
 The updater runs from Semaphore with `--jobs 1`. **Preview** refreshes APT
 metadata, simulates upgrades and reports kernel/reboot status; it does not install,
-remove or clean packages. **Apply** performs package maintenance. Neither mode
-reboots nodes. Run the separate rolling-reboot preview and apply tasks when needed.
+remove or clean packages. **Apply** refuses installation until the target meets
+the preparation requirements above. Neither mode initiates reboots. Keep the
+release pinned and configure the apply template’s `--nodes` argument for the
+prepared node; do not enable unrestricted task argument overrides.
 
 Run the adapter and script failure-path checks on a Linux controller:
 

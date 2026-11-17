@@ -31,6 +31,17 @@ with open(os.environ['TEST_INVOCATION'],'w') as f: json.dump(sys.argv[1:],f)
 sys.exit(int(os.environ.get('TEST_SCRIPT_RC','0')))
 '''
 
+# Keep tests independent of the production maintenance lock on a live runner.
+DRIVER = '''import builtins,os,runpy,sys
+real_open=builtins.open
+def test_open(path,*args,**kwargs):
+ if path=='/tmp/proxmox-cluster-maintenance.lock':path=os.environ['TEST_LOCK_PATH']
+ return real_open(path,*args,**kwargs)
+builtins.open=test_open
+sys.argv=sys.argv[1:]
+runpy.run_path(sys.argv[0],run_name='__main__')
+'''
+
 
 class RunnerTests(unittest.TestCase):
     def run_case(self, *args, **extra):
@@ -45,8 +56,9 @@ class RunnerTests(unittest.TestCase):
             env.update(PATH=str(tmp) + os.pathsep + env.get('PATH', ''),
                        PVE_NODES_JSON=json.dumps({'NODE-1':'192.0.2.1','NODE-2':'192.0.2.2'}),
                        PVE_CLUSTER_HOST='NODE-1', PVE_KNOWN_HOSTS='NODE-1 ssh-ed25519 fake',
-                       PVE_SSH_PRIVATE_KEY='SECRET-MARKER', TEST_INVOCATION=str(invocation), **extra)
-            result = subprocess.run([sys.executable, str(RUNNER), *args],env=env,
+                       PVE_SSH_PRIVATE_KEY='SECRET-MARKER', TEST_INVOCATION=str(invocation),
+                       TEST_LOCK_PATH=str(tmp/'maintenance.lock'), **extra)
+            result = subprocess.run([sys.executable, '-c', DRIVER, str(RUNNER), *args],env=env,
                                     text=True,capture_output=True,timeout=10)
             self.assertNotIn('SECRET-MARKER',result.stdout + result.stderr)
             return result, json.loads(invocation.read_text()) if invocation.exists() else None
