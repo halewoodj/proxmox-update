@@ -85,5 +85,11 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(plan_packages('Inst pve-manager [9.2.29] (9.2.30 x)\n0 not upgraded.'),['pve-manager'])
         self.assertEqual(plan_packages('0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.'),[])
 
+    def test_scoped_repair_leaves_other_updates_for_the_full_upgrade(self):
+        output='Inst libpve-notify-perl [9.1.9] (9.1.11 x)\n4 upgraded, 0 newly installed, 0 to remove and 14 not upgraded.'
+        self.assertEqual(plan_packages(output, complete=False),['libpve-notify-perl'])
+        with self.assertRaises(ValueError):plan_packages(output)
+        with self.assertRaises(ValueError):plan_packages('Remv pve-manager [9.2.30]',complete=False)
+
 
 if __name__=='__main__':unittest.main()

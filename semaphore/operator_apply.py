@@ -84,10 +84,10 @@ def resume_state(path, target, data, boots):
     return state
 
 
-def plan_packages(output):
+def plan_packages(output, *, complete=True):
     if re.search(r'^Remv ', output, re.MULTILINE):
         raise ValueError('Package removals require a separate review')
-    if re.search(r'\d+ not upgraded', output) and not re.search(r'\b0 not upgraded', output):
+    if complete and re.search(r'\d+ not upgraded', output) and not re.search(r'\b0 not upgraded', output):
         raise ValueError('APT is keeping packages back; inspect the plan')
     return [line.split()[1] for line in output.splitlines() if line.startswith('Inst ')]
 
@@ -176,7 +176,7 @@ def worker(args):
         package(node, directory, 'Refresh APT metadata', APT+'-o APT::Update::Error-Mode=any update', 1800)
         if node == args.resume_node:
             fix = '--fix-broken --no-remove --reinstall install '+shlex.quote(args.repair_package)
-            plan_packages(package(node, directory, 'Simulate package recovery', APT+'-s '+fix, 1800))
+            plan_packages(package(node, directory, 'Simulate package recovery', APT+'-s '+fix, 1800), complete=False)
             package(node, directory, 'Recover interrupted package', APT+'-y '+fix)
             data, baseline = recovered(nodes, boots, directory, node+'-repaired')
             rebase_owned(helper, data, baseline)
