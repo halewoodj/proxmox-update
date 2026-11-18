@@ -107,6 +107,14 @@ Each boundary also compares Ceph's monitor election epoch with the run's initial
 baseline. A monitor election stops the run even if `HEALTH_OK` has recovered
 between checks; another node cannot start after that event.
 
+The initial check also validates the entire selected rollout against existing HA
+maintenance. If NODE-1 is already held, selecting NODE-1 and NODE-2 is blocked
+before any node job, APT command or HA change: restoring NODE-1's original settings
+would preserve that hold and prevent NODE-2 from proceeding. A scoped
+`--nodes NODE-1` run is allowed and still preserves the pre-existing hold. Inspect
+and explicitly resolve an existing hold before a wider rollout; the updater does
+not clear it automatically.
+
 1. Verify healthy peers, memory headroom, stable HA services and no conflicting
    Proxmox tasks or pending HA commands. Running guests outside HA require manual
    evacuation; the script does not guess their destination or storage options.

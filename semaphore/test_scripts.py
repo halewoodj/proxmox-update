@@ -98,12 +98,16 @@ class ScriptTests(unittest.TestCase):
                 p.chmod(0o700)
             log=tmp/'commands.jsonl'
             fixture=tmp/'fixture.json';data=healthy()
-            if extra.get('TEST_AUTO'):
+            if extra.get('TEST_AUTO') or not extra.get('TEST_APPLY'):
                 for d in data.values():
                     d.update(manager={},active_tasks=[],ha_config=[{'sid':'vm:100'}],crm_commands='')
                     d['ha']=d['ha'].replace('maintenance, watchdog standby','active, watchdog active')
                     d['resources']=[{'type':'node','node':n,'maxmem':64*1024**3,'mem':8*1024**3} for n in data]
                 data['NODE-1'].update(crm_active='active',crm_unit='enabled',watchdog_active=True)
+            if extra.get('TEST_EXISTING_MAINT'):
+                for d in data.values():
+                    d['manager']={'node_request':{'NODE-1':{'maintenance':1}}}
+                    d['ha']=d['ha'].replace('lrm NODE-1 (active, watchdog active','lrm NODE-1 (maintenance mode, watchdog standby')
             fixture.write_text(json.dumps(data))
             nodes=tmp/'nodes.jsonl'
             env=os.environ.copy()
@@ -139,7 +143,7 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless((ROOT/'update.sh').exists() and BASH_MAJOR>=4,'requires updater and Bash 4+')
     def test_failed_apt_update_returns_failure(self):
-        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_APT_FAIL='1')
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_APT_FAIL='1')
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertIn('apt-get update failed',result.stdout)
         self.assertFalse(any('dist-upgrade' in c for c in commands))
@@ -148,7 +152,7 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_upgrade_failure_stops_before_second_node_and_prints_diagnostic(self):
-        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_UPGRADE_FAIL='1')
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_UPGRADE_FAIL='1')
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertIn('dpkg exact failure diagnostic',result.stderr)
         self.assertIn('Skipped after an earlier node failed',result.stdout)
@@ -156,7 +160,7 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_armed_ha_blocks_package_changes(self):
-        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_ARMED='1')
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_SELECTED='NODE-1',TEST_ARMED='1')
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
         self.assertFalse(any('APT::Update::Error-Mode=any update' in c for c in commands))
@@ -165,7 +169,7 @@ class ScriptTests(unittest.TestCase):
     def test_reboot_or_ceph_warning_after_success_stops_remaining_nodes(self):
         for scenario in ['TEST_POST_REBOOT','TEST_POST_CEPH','TEST_POST_ELECTION']:
             with self.subTest(scenario=scenario):
-                result,commands=self.run_script('update.sh',TEST_APPLY='1',**{scenario:'1'})
+                result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
                 self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
                 if scenario=='TEST_POST_ELECTION':
@@ -175,7 +179,7 @@ class ScriptTests(unittest.TestCase):
     def test_removal_and_parallel_apply_are_rejected(self):
         for scenario in ['TEST_REMOVAL','TEST_PARALLEL']:
             with self.subTest(scenario=scenario):
-                result,commands=self.run_script('update.sh',TEST_APPLY='1',**{scenario:'1'})
+                result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
                 self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
 
@@ -185,6 +189,24 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),1)
         self.assertFalse(any('autoremove' in c or 'apt-get clean' in c for c in commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_existing_maintenance_blocks_whole_rollout_without_node_changes(self):
+        for mode in [{},{'TEST_APPLY':'1'}]:
+            with self.subTest(mode=mode):
+                result,commands=self.run_script('update.sh',TEST_AUTO='1',TEST_EXISTING_MAINT='1',**mode)
+                self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+                self.assertIn('Selected rollout blocked: existing HA maintenance on NODE-1',result.stdout+result.stderr)
+                self.assertIn('no node jobs started',result.stdout+result.stderr)
+                self.assertNotIn('Starting Node Jobs',result.stdout)
+                self.assertFalse(any('apt-get' in c or c.startswith('timeout --preserve-status 90s ') for c in commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_single_held_node_remains_scoped_and_preserves_its_hold(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_EXISTING_MAINT='1',TEST_SELECTED='NODE-1',TEST_NO_CHANGES='1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse(any('node-maintenance disable' in c or 'node-maintenance enable' in c for c in commands))
+        self.assertFalse(any(r['node']=='NODE-2' and 'apt-get' in r['command'] for r in self.node_commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_automatic_apply_prepares_before_install_and_restores_after_verification(self):
@@ -235,7 +257,7 @@ class ScriptTests(unittest.TestCase):
     def test_missing_worker_summary_and_failed_verification_stop_queue(self):
         for scenario in ['TEST_LOST_WORKER','TEST_BAD_VERSION']:
             with self.subTest(scenario=scenario):
-                result,commands=self.run_script('update.sh',TEST_APPLY='1',**{scenario:'1'})
+                result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
                 self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
 

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from update_guard import snapshot, verify_cluster, verify_target
+from update_guard import snapshot, verify_cluster, verify_target, maintenance_requested, lrm_maintenance
 
 
 class MaintenanceInterrupted(Exception):
@@ -28,12 +28,6 @@ def remote(node, args):
         print(result.stdout.strip(), flush=True)
 
 
-def lrm_maintenance(data, node):
-    return bool(re.search(r'^lrm '+re.escape(node)+
-                          r' \(maintenance(?: mode)?, watchdog (?:active|standby|released|closed), ',
-                          data['ha'], re.MULTILINE))
-
-
 def running(data, node):
     return [r for r in data['resources'] if r.get('node') == node
             and r.get('type') in ['qemu','lxc'] and r.get('status') != 'stopped']
@@ -42,10 +36,6 @@ def running(data, node):
 def stable(data):
     return all(re.search(r', (?:started|stopped|disabled)\)$', line)
                for line in data['ha'].splitlines() if line.startswith('service '))
-
-
-def maintenance_requested(data, node):
-    return bool(data['manager'].get('node_request', {}).get(node, {}).get('maintenance'))
 
 
 def active_work(data):

@@ -325,7 +325,11 @@ update_node() {
       node_status "${CYAN}Preparing HA maintenance before APT writes...${RESET}"
       if ! maintenance_step "$NODE" prepare; then
         node_status "${RED}Maintenance preparation failed${RESET}"
-        write_summary 0 "" "" "" 0 "FAILED" "maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        local PREPARATION_DETAIL="maintenance preparation failed; no changes made; see $TMP_DIR/$NODE.log"
+        if [ -f "$TMP_DIR/$NODE.maintenance.json" ]; then
+          PREPARATION_DETAIL="maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        fi
+        write_summary 0 "" "" "" 0 "FAILED" "$PREPARATION_DETAIL"
         return 1
       fi
     fi
@@ -623,8 +627,8 @@ interrupt_controller() {
 }
 trap interrupt_controller INT TERM HUP
 
-if ! cluster_gate; then
-  echo "Initial health check failed; no node jobs started." >&2
+if ! cluster_gate --selected "$(IFS=,; echo "${NODES[*]}")"; then
+  echo "Initial readiness check failed; no node jobs started." >&2
   exit 1
 fi
 

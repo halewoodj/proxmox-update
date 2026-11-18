@@ -4,7 +4,7 @@ from pathlib import Path
 import pathlib
 import tempfile
 import unittest
-from update_guard import WATCHDOG_PROBE, cluster_baseline, verify_cluster, verify_target
+from update_guard import WATCHDOG_PROBE, cluster_baseline, verify_cluster, verify_target, verify_selection
 
 
 def healthy():
@@ -32,6 +32,30 @@ def healthy():
 
 
 class GuardTests(unittest.TestCase):
+    def test_existing_maintenance_blocks_conflicting_selection_upfront(self):
+        data=healthy()
+        for selected in [['NODE-1','NODE-2'],['NODE-2']]:
+            with self.subTest(selected=selected):
+                with self.assertRaisesRegex(ValueError,'existing HA maintenance on NODE-1'):
+                    verify_selection(list(data),selected,data)
+        verify_selection(list(data),['NODE-1'],data)
+
+    def test_selection_checks_lrm_holds_and_all_observers(self):
+        data=healthy()
+        for d in data.values():d['manager']={}
+        with self.assertRaisesRegex(ValueError,'existing HA maintenance'):
+            verify_selection(list(data),list(data),data)
+        for d in data.values():d['ha']=d['ha'].replace('maintenance, watchdog standby','active, watchdog active')
+        verify_selection(list(data),list(data),data)
+        data['NODE-2']['manager']={'node_request':{'NODE-1':{'maintenance':1}}}
+        with self.assertRaisesRegex(ValueError,'existing HA maintenance'):
+            verify_selection(list(data),list(data),data)
+
+    def test_invalid_selection_is_rejected(self):
+        data=healthy()
+        for selected in [[],['NODE-1','NODE-1'],['NODE-3']]:
+            with self.assertRaises(ValueError):verify_selection(list(data),selected,data)
+
     def test_ready_cluster_and_evacuated_target(self):
         data=healthy()
         verify_cluster(list(data),data)

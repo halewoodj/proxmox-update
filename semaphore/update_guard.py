@@ -72,6 +72,29 @@ def cluster_baseline(snapshots):
             for n,d in snapshots.items()}
 
 
+def maintenance_requested(data, node):
+    return bool(data['manager'].get('node_request', {}).get(node, {}).get('maintenance'))
+
+
+def lrm_maintenance(data, node):
+    return bool(re.search(r'^lrm '+re.escape(node)+
+                          r' \(maintenance(?: mode)?, watchdog (?:active|standby|released|closed), ',
+                          data['ha'], re.MULTILINE))
+
+
+def verify_selection(nodes, selected, snapshots):
+    if not selected or len(selected)!=len(set(selected)) or not set(selected)<=set(nodes):
+        raise ValueError('Selected nodes must be distinct approved inventory members')
+    held={node for node in nodes for data in snapshots.values()
+          if maintenance_requested(data,node) or lrm_maintenance(data,node)}
+    blocked=[node for node in selected if held-{node}]
+    if blocked:
+        raise ValueError('Selected rollout blocked: existing HA maintenance on '+', '.join(sorted(held))+
+                         ' prevents processing '+', '.join(blocked)+
+                         '. Existing maintenance will be preserved; inspect and explicitly resolve the hold '
+                         'before a wider rollout. No node jobs have started.')
+
+
 def verify_cluster(expected, snapshots, baseline=None):
     if set(snapshots) != set(expected):
         raise ValueError('Missing node health evidence')
@@ -170,6 +193,7 @@ def main():
     parser.add_argument('--nodes', required=True)
     parser.add_argument('--state', required=True)
     parser.add_argument('--target')
+    parser.add_argument('--selected', help='Check the entire selected rollout before starting any node')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     nodes = args.nodes.split(',')
@@ -184,6 +208,8 @@ def main():
     path = Path(args.state)
     baseline = json.loads(path.read_text()) if path.exists() else None
     verify_cluster(nodes, snapshots, baseline)
+    if args.selected is not None:
+        verify_selection(nodes,args.selected.split(','),snapshots)
     if args.apply:
         verify_target(args.target, snapshots)
     if baseline is None:
