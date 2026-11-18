@@ -67,16 +67,28 @@ print(json.dumps({
 '''
 
 
+def cluster_baseline(snapshots):
+    return {n:{'boot_id':d['boot_id'],'ceph_election_epoch':d['ceph']['election_epoch']}
+            for n,d in snapshots.items()}
+
+
 def verify_cluster(expected, snapshots, baseline=None):
     if set(snapshots) != set(expected):
         raise ValueError('Missing node health evidence')
+    epochs={d['ceph']['election_epoch'] for d in snapshots.values()}
+    if len(epochs)!=1 or any(type(epoch) is not int or epoch<1 for epoch in epochs):
+        raise ValueError('Ceph monitor election evidence is missing or observers disagree')
     for node, data in snapshots.items():
         if data['hostname'] != node:
             raise ValueError('Unexpected SSH hostname for ' + node)
         if not re.fullmatch(r'[0-9a-f-]{36}', data['boot_id']):
             raise ValueError('Invalid boot ID on ' + node)
-        if baseline is not None and baseline.get(node) != data['boot_id']:
-            raise ValueError('Unexpected reboot on ' + node + '; stop and investigate')
+        if baseline is not None:
+            original=baseline.get(node)
+            if not isinstance(original,dict) or 'ceph_election_epoch' not in original:
+                raise ValueError('Unsupported health baseline; inspect before retrying')
+            if original.get('boot_id') != data['boot_id']:
+                raise ValueError('Unexpected reboot on ' + node + '; stop and investigate')
         members = [line.split()[2] for line in data['members'].splitlines()
                    if len(line.split()) >= 3 and line.split()[0].isdigit()]
         if len(members) != len(expected) or set(members) != set(expected):
@@ -87,6 +99,9 @@ def verify_cluster(expected, snapshots, baseline=None):
         if ceph['health']['status'] != 'HEALTH_OK' or ceph['health'].get('mutes'):
             raise ValueError('Ceph unhealthy or health checks muted on ' + node + ': '
                              + json.dumps(ceph['health'],sort_keys=True))
+        if baseline is not None and original['ceph_election_epoch'] != ceph['election_epoch']:
+            raise ValueError('Ceph monitor election changed during this run on '+node+
+                             '; stop even though health has recovered and inspect before another node')
         osds = ceph['osdmap']
         if not (osds['num_osds'] == osds['num_up_osds'] == osds['num_in_osds']):
             raise ValueError('Ceph has missing OSDs on ' + node)
@@ -172,9 +187,9 @@ def main():
     if args.apply:
         verify_target(args.target, snapshots)
     if baseline is None:
-        path.write_text(json.dumps({n:d['boot_id'] for n,d in snapshots.items()})+'\n')
+        path.write_text(json.dumps(cluster_baseline(snapshots))+'\n')
         path.chmod(0o600)
-    print('Cluster health, package state and unchanged boot IDs verified.', flush=True)
+    print('Cluster health, package state, unchanged boot IDs and Ceph election epoch verified.', flush=True)
 
 
 if __name__ == '__main__':

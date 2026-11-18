@@ -4,7 +4,7 @@ from pathlib import Path
 import pathlib
 import tempfile
 import unittest
-from update_guard import WATCHDOG_PROBE, verify_cluster, verify_target
+from update_guard import WATCHDOG_PROBE, cluster_baseline, verify_cluster, verify_target
 
 
 def healthy():
@@ -13,7 +13,7 @@ def healthy():
         result[n] = {
             'hostname':n, 'boot_id':'a'*8+'-'+ 'b'*4+'-'+ 'c'*4+'-'+ 'd'*4+'-'+'e'*12,
             'members':'1 1 NODE-1\n2 1 NODE-2', 'quorum':'Quorate: Yes',
-            'ceph':{'health':{'status':'HEALTH_OK','mutes':[]},
+            'ceph':{'health':{'status':'HEALTH_OK','mutes':[]},'election_epoch':100,
                     'osdmap':{'num_osds':4,'num_up_osds':4,'num_in_osds':4},
                     'pgmap':{'num_pgs':64,'pgs_by_state':[{'state_name':'active+clean','count':64}]}},
             'audit':'', 'now':1000,
@@ -96,10 +96,22 @@ class GuardTests(unittest.TestCase):
                 with self.assertRaises(ValueError):verify_cluster(['NODE-1','NODE-2'],data)
 
     def test_unexpected_reboot_is_rejected_even_after_health_recovers(self):
-        data=healthy(); baseline={n:d['boot_id'] for n,d in data.items()}
+        data=healthy(); baseline=cluster_baseline(data)
         data['NODE-1']['boot_id']='f'*8+'-'+ 'b'*4+'-'+ 'c'*4+'-'+ 'd'*4+'-'+'e'*12
         with self.assertRaisesRegex(ValueError,'Unexpected reboot'):
             verify_cluster(list(data),data,baseline)
+
+    def test_monitor_election_is_rejected_after_health_recovers(self):
+        data=healthy();baseline=cluster_baseline(data)
+        for d in data.values():d['ceph']['election_epoch']+=2
+        with self.assertRaisesRegex(ValueError,'election changed'):
+            verify_cluster(list(data),data,baseline)
+
+    def test_disagreeing_or_invalid_election_evidence_is_rejected(self):
+        for value in [101,0,'100']:
+            data=healthy();data['NODE-1']['ceph']['election_epoch']=value
+            with self.assertRaisesRegex(ValueError,'election evidence'):
+                verify_cluster(list(data),data)
 
     def test_clean_background_scrub_is_allowed_but_recovery_is_not(self):
         for state in ['active+clean+scrubbing','active+clean+scrubbing+deep']:

@@ -34,6 +34,7 @@ if command.startswith('python3 -c '):
  installed=os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+node)
  if os.environ.get('TEST_POST_REBOOT') and installed: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
  if os.environ.get('TEST_POST_CEPH') and installed:data['ceph']['health']['status']='HEALTH_WARN'
+ if os.environ.get('TEST_POST_ELECTION') and any(os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+n) for n in ['NODE-1','NODE-2']):data['ceph']['election_epoch']+=2
  print(json.dumps(data))
 elif command.startswith('timeout --preserve-status 90s '):
  args=tokens[3:]
@@ -162,11 +163,13 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_reboot_or_ceph_warning_after_success_stops_remaining_nodes(self):
-        for scenario in ['TEST_POST_REBOOT','TEST_POST_CEPH']:
+        for scenario in ['TEST_POST_REBOOT','TEST_POST_CEPH','TEST_POST_ELECTION']:
             with self.subTest(scenario=scenario):
                 result,commands=self.run_script('update.sh',TEST_APPLY='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
                 self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
+                if scenario=='TEST_POST_ELECTION':
+                    self.assertIn('election changed',result.stdout+result.stderr)
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_removal_and_parallel_apply_are_rejected(self):

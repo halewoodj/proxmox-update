@@ -7,6 +7,7 @@ import unittest
 
 from maintenance import Maintenance, check_plan
 from test_update_guard import healthy
+from update_guard import cluster_baseline
 
 GiB=1024**3
 
@@ -54,7 +55,7 @@ class MaintenanceTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.cluster=Cluster()
         self.path=Path(self.tmp.name)/'node.json'
-        self.baseline={n:d['boot_id'] for n,d in self.cluster.data.items()}
+        self.baseline=cluster_baseline(self.cluster.data)
         self.helper=Maintenance(list(self.cluster.data),'NODE-1',self.path,self.baseline,
                                 collect=lambda:copy.deepcopy(self.cluster.data),execute=self.cluster.execute,
                                 sleep=lambda _:None,clock=lambda:0,timeout=1)
