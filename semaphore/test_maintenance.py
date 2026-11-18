@@ -70,6 +70,20 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.cluster.commands[-3:],[['systemctl','unmask','--runtime','pve-ha-crm'],
             ['systemctl','start','pve-ha-crm'],['ha-manager','crm-command','node-maintenance','disable','NODE-1']])
 
+    def test_installed_proxmox_maintenance_mode_prepares_and_restores(self):
+        execute=self.cluster.execute
+        def installed_status(node,args):
+            for d in self.cluster.data.values():
+                d['ha']=d['ha'].replace('maintenance mode, watchdog active','maintenance, watchdog standby')
+            execute(node,args)
+            for d in self.cluster.data.values():
+                d['ha']=d['ha'].replace('maintenance, watchdog standby','maintenance mode, watchdog active')
+        self.helper.execute=installed_status
+        self.helper.prepare()
+        self.helper.restore()
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'restored')
+        self.assertFalse(self.cluster.data['NODE-1']['manager'])
+
     def test_preview_plan_never_changes_services_or_state(self):
         self.helper.plan()
         self.assertEqual(self.cluster.commands,[])
@@ -99,6 +113,19 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'stop failure'):self.helper.prepare()
         self.assertFalse(any('mask' in args for args in self.cluster.commands))
         self.assertEqual(json.loads(self.path.read_text())['phase'],'stopping_crm')
+
+    def test_unverified_or_connected_watchdog_never_allows_masking(self):
+        for changes in [{'watchdog_active':True},{'watchdog_verified':False}]:
+            with self.subTest(changes=changes):
+                self.setUp()
+                execute=self.cluster.execute
+                def stopped_with_unsafe_watchdog(node,args):
+                    execute(node,args)
+                    if args[0]=='systemctl' and args[1]=='stop':self.cluster.data[node].update(changes)
+                self.helper.execute=stopped_with_unsafe_watchdog
+                times=iter([0,0,0,2]);self.helper.clock=lambda:next(times)
+                with self.assertRaisesRegex(ValueError,'Timed out'):self.helper.prepare()
+                self.assertFalse(any('mask' in args for args in self.cluster.commands))
 
     def test_preexisting_maintenance_and_mask_are_preserved(self):
         self.cluster.execute('NODE-1',['ha-manager','crm-command','node-maintenance','enable','NODE-1'])

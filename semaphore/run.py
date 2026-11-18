@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 PROGRAM = 'update.sh'
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +115,40 @@ def script_args(mode, control, selected):
     return args
 
 
+def run_script(argv,env,lock_fd):
+    process=None
+    interrupted=[]
+    def stop(signum,frame):
+        if not interrupted:interrupted.append(time.monotonic())
+        if process is not None:
+            try:os.killpg(process.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+    previous={sig:signal.signal(sig,stop) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
+    try:
+        # Semaphore signals the runner PID. A separate group lets the runner
+        # forward that cancellation to Bash workers, helpers and SSH children.
+        # Keep the maintenance lock in the worker too: killing only the runner
+        # must not permit a second job while the original worker is still alive.
+        process=subprocess.Popen(argv,env=env,start_new_session=True,pass_fds=(lock_fd,))
+        if interrupted:stop(signal.SIGTERM,None)
+        while True:
+            try:
+                result=process.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if interrupted and time.monotonic()-interrupted[0]>20:
+                    try:os.killpg(process.pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+        if interrupted:
+            try:os.killpg(process.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+            print('Runner cancelled; no further nodes will start. Inspect retained state and remote APT before retrying.',file=sys.stderr)
+            return 130
+        return result
+    finally:
+        for sig,handler in previous.items():signal.signal(sig,handler)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['preview', 'apply'])
@@ -142,7 +178,7 @@ def main():
                 print('Automatic HA maintenance is planned only; preview does not migrate guests or change services.', flush=True)
             elif PROGRAM == 'update.sh':
                 print('Apply prepares one HA node at a time, then restores it after verification. Container migration can restart containers.', flush=True)
-            return subprocess.call(script_args(args.mode, control, selected), env=env)
+            return run_script(script_args(args.mode, control, selected),env,lock.fileno())
 
 
 if __name__ == '__main__':

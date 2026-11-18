@@ -1,10 +1,13 @@
 """Safety checks run with fake SSH and Bash; no network or package operations."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,9 +28,20 @@ elif command=='ceph health': print(os.environ.get('TEST_HEALTH','HEALTH_OK'))
 else: sys.exit(90)
 '''
 FAKE_BASH = '''#!/usr/bin/env python3
-import os,sys,json
+import os,sys,json,signal,time,subprocess,pathlib
 assert 'PVE_SSH_PRIVATE_KEY' not in os.environ
+if os.environ.get('TEST_WAIT'):
+ pathlib.Path(os.environ['TEST_PID']).write_text(str(os.getpid()))
+ child_code="import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,lambda s,f:(pathlib.Path(sys.argv[1]).write_text('stopped'),sys.exit(0))); pathlib.Path(sys.argv[2]).write_text('ready'); time.sleep(30)"
+ child=subprocess.Popen([sys.executable,'-c',child_code,os.environ['TEST_CHILD_STOPPED'],os.environ['TEST_CHILD_READY']])
+ while not pathlib.Path(os.environ['TEST_CHILD_READY']).exists():time.sleep(.02)
+ def stopped(s,f):
+  child.wait(timeout=5)
+  pathlib.Path(os.environ['TEST_STOPPED']).write_text(str(pathlib.Path(os.environ['PATH'].split(os.pathsep)[0]).parent.joinpath('id_ed25519').exists()))
+  sys.exit(130)
+ signal.signal(signal.SIGTERM,stopped)
 with open(os.environ['TEST_INVOCATION'],'w') as f: json.dump(sys.argv[1:],f)
+if os.environ.get('TEST_WAIT'):time.sleep(30)
 sys.exit(int(os.environ.get('TEST_SCRIPT_RC','0')))
 '''
 
@@ -58,8 +72,32 @@ class RunnerTests(unittest.TestCase):
                        PVE_CLUSTER_HOST='NODE-1', PVE_KNOWN_HOSTS='NODE-1 ssh-ed25519 fake',
                        PVE_SSH_PRIVATE_KEY='SECRET-MARKER', TEST_INVOCATION=str(invocation),
                        TEST_LOCK_PATH=str(tmp/'maintenance.lock'), **extra)
-            result = subprocess.run([sys.executable, '-c', DRIVER, str(RUNNER), *args],env=env,
-                                    text=True,capture_output=True,timeout=10)
+            command=[sys.executable, '-c', DRIVER, str(RUNNER), *args]
+            if extra.get('TEST_WAIT'):
+                env.update(TEST_CHILD_STOPPED=str(tmp/'child-stopped'),TEST_CHILD_READY=str(tmp/'child-ready'),TEST_STOPPED=str(tmp/'stopped'),TEST_PID=str(tmp/'pid'))
+                process=subprocess.Popen(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                try:
+                    deadline=time.monotonic()+10
+                    while not invocation.exists() and time.monotonic()<deadline:time.sleep(.02)
+                    self.assertTrue(invocation.exists(),'Runner did not start its child')
+                    if extra.get('TEST_FORCE'):
+                        process.kill();process.wait(timeout=5)
+                        with (tmp/'maintenance.lock').open('a') as lock:
+                            with self.assertRaises(BlockingIOError):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        os.killpg(int((tmp/'pid').read_text()),signal.SIGTERM)
+                    else:
+                        process.send_signal(signal.SIGTERM)
+                    stdout,stderr=process.communicate(timeout=10)
+                    result=subprocess.CompletedProcess(command,process.returncode,stdout,stderr)
+                    self.assertTrue((tmp/'child-stopped').exists(),'Cancellation did not reach the grandchild')
+                    self.assertEqual((tmp/'stopped').read_text(),'True','SSH files removed before the child exited')
+                finally:
+                    if process.poll() is None:process.kill();process.wait()
+                    if (tmp/'pid').exists():
+                        try:os.killpg(int((tmp/'pid').read_text()),signal.SIGKILL)
+                        except ProcessLookupError:pass
+            else:
+                result = subprocess.run(command,env=env,text=True,capture_output=True,timeout=10)
             self.assertNotIn('SECRET-MARKER',result.stdout + result.stderr)
             return result, json.loads(invocation.read_text()) if invocation.exists() else None
 
@@ -106,6 +144,16 @@ class RunnerTests(unittest.TestCase):
     def test_script_failure_is_reported(self):
         result, args = self.run_case('preview',TEST_SCRIPT_RC='42')
         self.assertEqual(result.returncode,42)
+        self.assertIsNotNone(args)
+
+    def test_runner_cancellation_reaches_child_and_grandchild_before_cleanup(self):
+        result,args=self.run_case('apply','--nodes','NODE-1',TEST_WAIT='1')
+        self.assertEqual(result.returncode,130,result.stderr)
+        self.assertIsNotNone(args)
+
+    def test_killed_runner_retains_lock_until_worker_exits(self):
+        result,args=self.run_case('apply','--nodes','NODE-1',TEST_WAIT='1',TEST_FORCE='1')
+        self.assertEqual(result.returncode,-signal.SIGKILL,result.stderr)
         self.assertIsNotNone(args)
 
 

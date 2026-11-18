@@ -108,12 +108,16 @@ uses `--auto-maintenance` to process one node at a time:
 2. Verify healthy peers, memory headroom, stable HA services and no conflicting
    Proxmox tasks or pending HA commands. Running guests outside HA require manual
    evacuation; the script does not guess their destination or storage options.
-3. Request HA node maintenance and wait for all running guests to leave and for
-   the LRM watchdog to be released. HA respects its placement/storage rules;
+3. Request HA node maintenance and wait for all running guests and migration
+   workers to leave. HA respects its placement/storage rules;
    migration refusal or timeout stops the run. Container migrations can briefly
    restart containers.
 4. Gracefully stop the target CRM, wait for master handover when necessary and
-   verify all local watchdog clients have closed. Add a runtime CRM mask to keep
+   verify all local watchdog clients have closed using the running multiplexer's
+   socket ownership and active-client marker. Some HA versions display
+   `maintenance mode, watchdog active` even after the LRM closes its connection;
+   that inferred label does not prove the actual connection state.
+   Add a runtime CRM mask to keep
    package triggers from starting it during installation.
 5. Recheck cluster health, boot IDs, package state and the prepared target, then
    install with `--no-remove`. Preserve APT output and verify the result.

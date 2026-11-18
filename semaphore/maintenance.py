@@ -28,9 +28,9 @@ def remote(node, args):
         print(result.stdout.strip(), flush=True)
 
 
-def lrm_released(data, node):
+def lrm_maintenance(data, node):
     return bool(re.search(r'^lrm '+re.escape(node)+
-                          r' \(maintenance, watchdog (?:standby|released|closed), ',
+                          r' \(maintenance(?: mode)?, watchdog (?:active|standby|released|closed), ',
                           data['ha'], re.MULTILINE))
 
 
@@ -65,7 +65,7 @@ def check_plan(nodes, target, snapshots):
             raise ValueError('HA commands are pending; wait before maintenance')
         for node in nodes:
             if node != target and (maintenance_requested(observer, node)
-                                    or lrm_released(observer, node)):
+                                    or lrm_maintenance(observer, node)):
                 raise ValueError(node+' already has HA maintenance; prepare only one node at a time')
         if not stable(observer):
             raise ValueError('HA services are still transitioning; wait before maintenance')
@@ -145,8 +145,9 @@ class Maintenance:
             state['maintenance_owned'] = True
             self.record(state, 'requesting_maintenance')
             self.execute(self.target, ['ha-manager','crm-command','node-maintenance','enable',self.target])
-        data = self.wait('HA evacuation, stable services and released LRM watchdog',
-                         lambda d: all(lrm_released(v,self.target) and not running(v,self.target)
+        data = self.wait('HA evacuation and stable services',
+                         lambda d: all(maintenance_requested(v,self.target)
+                                       and lrm_maintenance(v,self.target) and not running(v,self.target)
                                        and stable(v) and not active_work(v) for v in d.values()))
         self.record(state, 'evacuated')
         if state['original_crm_active'] == 'active':
@@ -155,6 +156,7 @@ class Maintenance:
             self.execute(self.target, ['systemctl','stop','pve-ha-crm'])
         self.wait('CRM handover and all local watchdog clients released',
                   lambda d: d[self.target]['crm_active'] == 'inactive'
+                  and d[self.target].get('watchdog_verified',False)
                   and not d[self.target]['watchdog_active']
                   and all(not re.search(r'^master '+re.escape(self.target)+r'\s',v['ha'],re.MULTILINE)
                           for v in d.values()))
@@ -194,7 +196,7 @@ class Maintenance:
             self.execute(self.target, ['ha-manager','crm-command','node-maintenance','disable',self.target])
             self.wait('HA maintenance exit and stable services',
                       lambda d:all(not maintenance_requested(v,self.target)
-                                   and not lrm_released(v,self.target) and stable(v)
+                                   and not lrm_maintenance(v,self.target) and stable(v)
                                    and not active_work(v) for v in d.values()))
         self.read()
         self.record(state, 'restored')

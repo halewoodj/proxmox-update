@@ -1,7 +1,10 @@
 """Safety decisions using cluster fixtures; never contacts a host."""
 import copy
+from pathlib import Path
+import pathlib
+import tempfile
 import unittest
-from update_guard import verify_cluster, verify_target
+from update_guard import WATCHDOG_PROBE, verify_cluster, verify_target
 
 
 def healthy():
@@ -23,7 +26,7 @@ def healthy():
             'resources':[{'type':'qemu','node':'NODE-2','status':'running'}],
             'crm_active':'inactive','crm_unit':'masked-runtime',
             'manager':{'node_request':{'NODE-1':{'maintenance':1}}},'crm_commands':'',
-            'watchdog_active':False,
+            'watchdog_active':False,'watchdog_verified':True,
         }
     return result
 
@@ -33,6 +36,47 @@ class GuardTests(unittest.TestCase):
         data=healthy()
         verify_cluster(list(data),data)
         verify_target('NODE-1',data)
+
+    def test_installed_proxmox_label_requires_actual_released_connections(self):
+        for active in [False,True]:
+            with self.subTest(active=active):
+                data=healthy()
+                for d in data.values():
+                    d['ha']=d['ha'].replace('maintenance, watchdog standby',
+                                          'maintenance mode, watchdog active')
+                data['NODE-1']['watchdog_active']=active
+                if active:
+                    with self.assertRaisesRegex(ValueError,'active clients'):
+                        verify_target('NODE-1',data)
+                else:
+                    verify_target('NODE-1',data)
+
+    def test_missing_watchdog_connection_evidence_is_rejected(self):
+        data=healthy();data['NODE-1'].pop('watchdog_verified')
+        with self.assertRaisesRegex(ValueError,'evidence is missing'):verify_target('NODE-1',data)
+
+    def test_watchdog_socket_probe_detects_clients_and_fails_closed(self):
+        namespace={'pathlib':pathlib};exec(WATCHDOG_PROBE,namespace)
+        probe=namespace['watchdog_probe']
+        with tempfile.TemporaryDirectory() as tmp:
+            proc=Path(tmp)/'proc';run=Path(tmp)/'run'
+            (proc/'42/fd').mkdir(parents=True);(proc/'net').mkdir();run.mkdir()
+            (proc/'42/comm').write_text('watchdog-mux\n')
+            (proc/'42/fd/4').symlink_to('socket:[100]')
+            listener='0: 00000002 00000000 00010000 0001 01 100 '+str(run/'watchdog-mux.sock')+'\n'
+            client='0: 00000003 00000000 00000000 0001 03 101 '+str(run/'watchdog-mux.sock')+'\n'
+            (proc/'net/unix').write_text('header\n'+listener)
+            self.assertEqual(probe(proc,run,42),{'watchdog_active':False,'watchdog_verified':True})
+            (run/'watchdog-mux.active').mkdir()
+            self.assertTrue(probe(proc,run,42)['watchdog_active'])
+            (run/'watchdog-mux.active').rmdir()
+            (proc/'42/fd/6').symlink_to('socket:[101]')
+            (proc/'net/unix').write_text('header\n'+listener+client)
+            self.assertTrue(probe(proc,run,42)['watchdog_active'])
+            (proc/'42/fd/6').unlink()
+            with self.assertRaisesRegex(RuntimeError,'ownership'):probe(proc,run,42)
+            (proc/'net/unix').write_text('header\n')
+            with self.assertRaises(RuntimeError):probe(proc,run,42)
 
     def test_each_unhealthy_boundary_is_rejected(self):
         cases=[
@@ -82,7 +126,8 @@ class GuardTests(unittest.TestCase):
     def test_maintenance_label_with_armed_watchdog_is_rejected(self):
         data=healthy()
         data['NODE-1']['ha']=data['NODE-1']['ha'].replace('maintenance, watchdog standby','maintenance, watchdog active')
-        with self.assertRaisesRegex(ValueError,'release its LRM watchdog'):verify_target('NODE-1',data)
+        data['NODE-1']['watchdog_active']=True
+        with self.assertRaisesRegex(ValueError,'active clients'):verify_target('NODE-1',data)
 
     def test_non_ha_guest_and_unfinished_ha_action_are_rejected(self):
         data=healthy();data['NODE-1']['resources'].append({'type':'lxc','node':'NODE-1','status':'running'})

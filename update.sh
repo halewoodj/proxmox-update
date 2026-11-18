@@ -270,7 +270,7 @@ update_node() {
   local SUMMARY_FILE="$3"
   local MODE_LABEL=""
   local ACTIVE_HELPER_PID=""
-  trap '[ -z "$ACTIVE_HELPER_PID" ] || kill -TERM "$ACTIVE_HELPER_PID" 2>/dev/null; exit 130' INT TERM HUP
+  trap 'if [ -n "$ACTIVE_HELPER_PID" ]; then kill -TERM "$ACTIVE_HELPER_PID" 2>/dev/null || true; wait "$ACTIVE_HELPER_PID" 2>/dev/null || true; fi; exit 130' INT TERM HUP
 
   if [ "$DRY_RUN" -eq 1 ]; then
     MODE_LABEL=" (dry run)"
@@ -604,6 +604,7 @@ printf 'Diagnostic logs and summaries: %s\n' "$TMP_DIR"
 interrupt_controller() {
   local PID
   for PID in "${NODE_PIDS[@]}"; do kill -TERM "$PID" 2>/dev/null || true; done
+  for PID in "${NODE_PIDS[@]}"; do wait "$PID" 2>/dev/null || true; done
   echo "Controller interrupted; no further nodes will start. Inspect maintenance state and remote APT before retrying." >&2
   exit 130
 }

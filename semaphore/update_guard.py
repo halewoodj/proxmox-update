@@ -10,12 +10,37 @@ import subprocess
 import sys
 
 
+WATCHDOG_PROBE = r'''
+def watchdog_probe(proc=pathlib.Path('/proc'), run=pathlib.Path('/run'), mux_pid=None):
+    if mux_pid is None:
+        mux_pid=int(read(['systemctl','show','watchdog-mux','-p','MainPID','--value']))
+    if mux_pid < 1 or (proc/str(mux_pid)/'comm').read_text().strip() != 'watchdog-mux':
+        raise RuntimeError('Cannot identify the running watchdog multiplexer')
+    sockets=set()
+    for fd in (proc/str(mux_pid)/'fd').iterdir():
+        link=str(fd.readlink())
+        if link.startswith('socket:[') and link.endswith(']'):
+            sockets.add(link[8:-1])
+    rows=[line.split() for line in (proc/'net/unix').read_text().splitlines()[1:]]
+    rows=[r for r in rows if len(r)==8 and r[7]==str(run/'watchdog-mux.sock')]
+    if not rows or any(r[6] not in sockets for r in rows):
+        raise RuntimeError('Watchdog socket ownership changed or cannot be verified')
+    listeners=[r for r in rows if r[3]=='00010000' and r[4]=='0001' and r[5]=='01']
+    if len(listeners)!=1:
+        raise RuntimeError('Cannot verify the watchdog listener')
+    # Accepted server sockets retain the listener's pathname in /proc/net/unix.
+    # Count every non-listener, including unknown states, as an active client.
+    return {'watchdog_active':(run/'watchdog-mux.active').exists() or len(rows)>1,
+            'watchdog_verified':True}
+'''
+
 SNAPSHOT = r'''
 import fcntl,json,pathlib,subprocess,socket,time
 def read(args):
     p=subprocess.run(args,capture_output=True,text=True,timeout=45)
     if p.returncode:raise RuntimeError(' '.join(args)+': '+p.stderr.strip())
     return p.stdout.strip()
+''' + WATCHDOG_PROBE + r'''
 for name in ['lock','lock-frontend']:
     with open('/var/lib/dpkg/'+name,'rb') as f:
         fcntl.lockf(f,fcntl.LOCK_SH|fcntl.LOCK_NB)
@@ -36,7 +61,7 @@ print(json.dumps({
     'ha_config':json.loads(read(['pvesh','get','/cluster/ha/resources','--output-format','json'])),
     'manager':json.loads(pathlib.Path('/etc/pve/ha/manager_status').read_text()),
     'active_tasks':json.loads(read(['pvesh','get','/nodes/'+socket.gethostname().split('.')[0]+'/tasks','--source','active','--output-format','json'])),
-    'watchdog_active':pathlib.Path('/run/watchdog-mux.active').exists(),
+    **watchdog_probe(),
     'crm_commands':pathlib.Path('/etc/pve/ha/crm_commands').read_text() if pathlib.Path('/etc/pve/ha/crm_commands').exists() else '',
 }))
 '''
@@ -86,6 +111,8 @@ def verify_target(node, snapshots):
     target = snapshots[node]
     if target['crm_active'] != 'inactive' or target['crm_unit'] not in ['masked','masked-runtime']:
         raise ValueError(node + ' CRM must be gracefully stopped and temporarily masked on the evacuated node')
+    if not target.get('watchdog_verified', False):
+        raise ValueError(node + ' watchdog connection evidence is missing')
     if target.get('watchdog_active', True):
         raise ValueError(node + ' watchdog multiplexer still has active clients')
     for observer, data in snapshots.items():
@@ -99,8 +126,11 @@ def verify_target(node, snapshots):
         if re.search(r'^master ' + re.escape(node) + r'\s', ha, re.MULTILINE):
             raise ValueError(node + ' is the HA master; hand over the CRM before updating')
         match = re.search(r'^lrm ' + re.escape(node) + r' \(([^\n]+)\)$', ha, re.MULTILINE)
-        if not match or not re.match(r'maintenance, watchdog (?:standby|released|closed), ', match[1]):
-            raise ValueError(node + ' must finish HA maintenance and release its LRM watchdog before updating')
+        # This installed HA version infers "watchdog active" from the maintenance
+        # state even after the LRM closes its connection. Actual release is proved
+        # above from the multiplexer sockets and active-client marker.
+        if not match or not re.match(r'maintenance(?: mode)?, watchdog (?:active|standby|released|closed), ', match[1]):
+            raise ValueError(node + ' must finish HA maintenance before updating')
         if any(r.get('node') == node and r.get('type') in ['qemu','lxc']
                and r.get('status') != 'stopped' for r in data['resources']):
             raise ValueError(node + ' still has running or unknown-state guests; evacuate them first')
