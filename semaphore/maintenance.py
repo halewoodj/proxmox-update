@@ -45,7 +45,11 @@ def service_transitions(data):
         if not match:raise ValueError('Unrecognized HA service status on '+data['hostname']+': '+line)
         state=match[3]
         if state in ['started','stopped','disabled']:continue
-        if state not in ['migrate','relocate','request_start','request_start_balance','request_stop']:
+        # ha-manager displays get_verbose_service_state(), not just CRM FSM
+        # names: a successful migration can display "starting" until its running
+        # flag arrives. These are pending observations, never permission to act.
+        if state not in ['migrate','relocate','request_start','request_start_balance','request_stop',
+                         'starting','stopping','queued','deleting']:
             raise ValueError('Unsafe HA service state on '+data['hostname']+': '+line)
         pending.append(line)
     return pending

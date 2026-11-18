@@ -164,15 +164,32 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_normal_ha_states_are_pending_but_unsafe_states_fail(self):
         for state in ['migrate','relocate','request_start','request_start_balance','request_stop',
+                      'starting','stopping','queued','deleting',
                       'error','fence','recovery','freeze','unexpected']:
             with self.subTest(state=state):
                 data=copy.deepcopy(self.cluster.data)
                 for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, '+state)
-                if state in ['migrate','relocate','request_start','request_start_balance','request_stop']:
+                if state in ['migrate','relocate','request_start','request_start_balance','request_stop',
+                             'starting','stopping','queued','deleting']:
                     with self.assertRaises(MaintenancePending):check_plan(list(data),'NODE-1',data)
                 else:
                     with self.assertRaisesRegex(ValueError,'Unsafe HA service state'):
                         check_plan(list(data),'NODE-1',data)
+
+    def test_installed_formatter_lifecycle_is_classified_by_input_semantics(self):
+        fixture=Path(__file__).parent/'fixtures/ha-display-states.json'
+        for case in json.loads(fixture.read_text())['cases']:
+            with self.subTest(case=case):
+                data=copy.deepcopy(self.cluster.data)
+                for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, '+case['display'])
+                if case['expect']=='ready':check_plan(list(data),'NODE-1',data)
+                elif case['expect']=='wait':
+                    with self.assertRaises(MaintenancePending):check_plan(list(data),'NODE-1',data)
+                else:
+                    try:check_plan(list(data),'NODE-1',data)
+                    except MaintenancePending:self.fail('Unsafe input state must stop rather than wait')
+                    except ValueError:pass
+                    else:self.fail('Unsafe input state was accepted')
 
     def test_prepare_waits_for_return_migration_before_any_changes(self):
         reads=0

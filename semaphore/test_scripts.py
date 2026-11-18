@@ -39,10 +39,10 @@ if command.startswith('python3 -c '):
   counter=os.environ['TEST_FIXTURE']+'.handoff.'+node
   count=int(open(counter).read())+1 if os.path.exists(counter) else 1
   open(counter,'w').write(str(count))
-  if count<=2:
-   state='error' if os.environ.get('TEST_HANDOFF_ERROR') and count==2 else 'migrate'
+  if count<=3:
+   state='error' if os.environ.get('TEST_HANDOFF_ERROR') and count==2 else ('starting' if count==3 else 'migrate')
    data['ha']=data['ha'].replace('NODE-2, started','NODE-2, '+state)
-   data['active_tasks']=[{'type':'qmigrate','id':'100'}]
+   data['active_tasks']=[{'type':'qmstart' if state=='starting' else 'qmigrate','id':'100'}]
  print(json.dumps(data))
 elif command.startswith('timeout --preserve-status 90s '):
  args=tokens[3:]
@@ -250,6 +250,7 @@ class ScriptTests(unittest.TestCase):
         result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_HANDOFF='1')
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('[NODE-2] HA is settling:',result.stdout)
+        self.assertIn('starting',result.stdout)
         self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),2)
         self.assertTrue(any(r['node']=='NODE-2' and '--no-remove dist-upgrade' in r['command'] for r in self.node_commands))
 
