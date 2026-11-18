@@ -86,11 +86,13 @@ def check_plan(nodes, target, snapshots):
                        'vzstart':'ct:','vzstop':'ct:','vzshutdown':'ct:'}
         def settling_task(task):
             kind=task.get('type')
-            return kind in ['qmigrate','vzmigrate'] or (kind in startup_tasks
+            return kind in ['qmigrate','vzmigrate','vzdump'] or (kind in startup_tasks
                     and startup_tasks[kind]+str(task.get('id','')) in managed)
         if any(not settling_task(t) for t in tasks):
             raise ValueError('Active Proxmox tasks on '+observer['hostname']+'; wait before maintenance')
-        pending.extend('HA task '+str(t.get('type'))+' '+str(t.get('id',''))+' on '+observer['hostname'] for t in tasks)
+        pending.extend('Proxmox task '+str(t.get('type'))+
+                       (' '+str(t['id']) if t.get('id') else '')+
+                       ' on '+observer['hostname'] for t in tasks)
     if pending:
         raise MaintenancePending('HA is settling: '+'; '.join(sorted(set(pending))))
     if data['crm_active'] not in ['active','inactive']:

@@ -124,6 +124,12 @@ Ceph regressions, changed election epochs and reboots still stop immediately.
 Logs name the service or migration task being awaited. No next-node maintenance
 request or APT command starts while the handoff is pending.
 
+An active scheduled `vzdump` backup also waits within that bounded readiness
+period. No evacuation or package write begins until the backup task finishes.
+Other conflicting/unknown task types still stop the run. An existing maintenance
+hold still requires explicit recovery; the updater does not clear someone else's
+hold to make a full selection proceed.
+
 1. Verify healthy peers, memory headroom, stable HA services and no conflicting
    Proxmox tasks or pending HA commands. Running guests outside HA require manual
    evacuation; the script does not guess their destination or storage options.

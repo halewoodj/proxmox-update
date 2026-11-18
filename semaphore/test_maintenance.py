@@ -103,7 +103,7 @@ class MaintenanceTests(unittest.TestCase):
                 c=Cluster()
                 if scenario=='non-ha':c.data['NODE-1']['ha_config']=[]
                 if scenario=='capacity':c.data['NODE-1']['resources'][1]['mem']=63*GiB
-                if scenario=='task':c.data['NODE-1']['active_tasks']=[{'type':'vzdump'}]
+                if scenario=='task':c.data['NODE-1']['active_tasks']=[{'type':'qmrestore'}]
                 if scenario=='other-maintenance':c.data['NODE-2']['manager']={'node_request':{'NODE-2':{'maintenance':1}}}
                 if scenario=='pending-command':c.data['NODE-1']['crm_commands']='enable-node-maintenance NODE-2'
                 with self.assertRaises(ValueError):check_plan(list(c.data),'NODE-1',c.data)
@@ -222,6 +222,29 @@ class MaintenanceTests(unittest.TestCase):
         self.helper.wait_ready()
         self.assertEqual(reads,4)
         self.assertEqual(self.cluster.commands,[])
+
+    def test_running_backup_waits_before_any_preparation_changes(self):
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads<=3:
+                self.assertFalse(self.path.exists())
+                self.assertEqual(self.cluster.commands,[])
+                data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
+            return data
+        self.helper.collect=collect
+        self.helper.prepare()
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
+        self.assertGreaterEqual(self.clock.now,15)
+
+    def test_stuck_backup_times_out_without_changes(self):
+        self.cluster.data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
+        with self.assertRaisesRegex(ValueError,'Timed out waiting for HA readiness'):
+            self.helper.prepare()
+        self.assertEqual(self.cluster.commands,[])
+        self.assertFalse(self.path.exists())
 
     def test_stuck_migration_times_out_without_state_or_commands(self):
         for d in self.cluster.data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')

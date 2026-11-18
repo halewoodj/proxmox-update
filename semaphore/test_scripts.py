@@ -41,6 +41,8 @@ if command.startswith('python3 -c '):
  if os.environ.get('TEST_POST_REBOOT') and installed: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
  if os.environ.get('TEST_POST_CEPH') and installed:data['ceph']['health']['status']='HEALTH_WARN'
  if os.environ.get('TEST_POST_ELECTION') and any(os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+n) for n in ['NODE-1','NODE-2']):data['ceph']['election_epoch']+=2
+ if os.environ.get('TEST_BACKUP_WAIT') and node=='NODE-2' and count<=3:
+  data['active_tasks']=[{'type':'vzdump','id':''}]
  if os.path.exists(os.environ['TEST_FIXTURE']+'.handoff'):
   counter=os.environ['TEST_FIXTURE']+'.handoff.'+node
   count=int(open(counter).read())+1 if os.path.exists(counter) else 1
@@ -58,6 +60,8 @@ elif command.startswith('timeout --preserve-status 90s '):
   print('injected evacuation refusal',file=sys.stderr);sys.exit(1)
  fixture=json.load(open(os.environ['TEST_FIXTURE']))
  if args[0]=='ha-manager':
+  if os.environ.get('TEST_BACKUP_WAIT') and args[-2]=='enable':
+   assert int(open(os.environ['TEST_FIXTURE']+'.NODE-2').read())>=4,'Maintenance started while backup still active'
   enable=args[-2]=='enable'
   for d in fixture.values():
    d['manager']={'node_request':{node:{'maintenance':1}}} if enable else {}
@@ -273,6 +277,13 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('starting',result.stdout)
         self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),2)
         self.assertTrue(any(r['node']=='NODE-2' and '--no-remove dist-upgrade' in r['command'] for r in self.node_commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_scheduled_backup_finishes_before_first_node_prepares(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_BACKUP_WAIT='1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('Proxmox task vzdump on NODE-2',result.stdout)
+        self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),2)
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_next_node_stops_if_pending_failback_becomes_an_error(self):
