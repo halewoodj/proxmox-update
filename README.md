@@ -156,6 +156,33 @@ inspection. It does not blindly release maintenance after an uncertain or failed
 package operation. Check remote APT/dpkg and that recovery record before retrying;
 restore the recorded original settings only after validating node health.
 
+APT refresh, simulation and installation run in uniquely named transient systemd
+services on the target. A supervisor inside each service must receive controller
+heartbeats before it starts package work. EOF requests cancellation immediately;
+a missing heartbeat revokes the lease after 15 seconds. PID 1 terminates the
+service's entire control group, including dpkg children that create their own
+sessions or ignore SSH hangup. A killed Semaphore runner also signals its Linux
+worker, and losing the local helper closes the remote lease.
+
+The controller records `<node>.apt.<identity>.json` beside the diagnostic logs
+before requesting the remote service. It verifies the owned service has no
+remaining processes and that the SSH start/wait request has ended before recording
+`quiescent`. If connectivity or blocked kernel I/O prevents verification, the
+record says `unverified`, the queue stops and HA preparation is retained. A stopped
+Semaphore task alone does not prove package work has ended. The runner waits for
+its helpers instead of forcibly killing them after a fixed grace period. Package
+processes are not sent SIGKILL; cancellation can leave packages needing repair.
+
+For an uncertain stop, use the exact unit identity in that record and verify its
+`Description`, `ActiveState`, `ControlGroup` and remaining processes on the target.
+Do not guess a unit name, clear maintenance or retry package operations until
+termination and package state have been checked. The service and lease use
+unified cgroup v2 and systemd 254 or newer; native validation uses Proxmox's systemd
+257. Tests cover EOF, invalid/expired leases, ownership checks, failed termination
+proof, runner death, cancellation during package work and preventing the next node.
+
+Reference: [systemd process termination](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html).
+
 For the same automatic flow from a Linux controller:
 
 ```bash

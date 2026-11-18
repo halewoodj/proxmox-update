@@ -36,6 +36,7 @@ if os.environ.get('TEST_WAIT'):
  child=subprocess.Popen([sys.executable,'-c',child_code,os.environ['TEST_CHILD_STOPPED'],os.environ['TEST_CHILD_READY']])
  while not pathlib.Path(os.environ['TEST_CHILD_READY']).exists():time.sleep(.02)
  def stopped(s,f):
+  if not pathlib.Path(os.environ['TEST_CHILD_STOPPED']).exists():child.terminate()
   child.wait(timeout=5)
   pathlib.Path(os.environ['TEST_STOPPED']).write_text(str(pathlib.Path(os.environ['PATH'].split(os.pathsep)[0]).parent.joinpath('id_ed25519').exists()))
   sys.exit(130)
@@ -82,9 +83,10 @@ class RunnerTests(unittest.TestCase):
                     self.assertTrue(invocation.exists(),'Runner did not start its child')
                     if extra.get('TEST_FORCE'):
                         process.kill();process.wait(timeout=5)
-                        with (tmp/'maintenance.lock').open('a') as lock:
-                            with self.assertRaises(BlockingIOError):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                        os.killpg(int((tmp/'pid').read_text()),signal.SIGTERM)
+                        if not sys.platform.startswith('linux'):
+                            with (tmp/'maintenance.lock').open('a') as lock:
+                                with self.assertRaises(BlockingIOError):fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                            os.killpg(int((tmp/'pid').read_text()),signal.SIGTERM)
                     else:
                         process.send_signal(signal.SIGTERM)
                     stdout,stderr=process.communicate(timeout=10)
@@ -151,7 +153,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode,130,result.stderr)
         self.assertIsNotNone(args)
 
-    def test_killed_runner_retains_lock_until_worker_exits(self):
+    def test_killed_runner_signals_linux_worker_and_preserves_credentials_until_exit(self):
         result,args=self.run_case('apply','--nodes','NODE-1',TEST_WAIT='1',TEST_FORCE='1')
         self.assertEqual(result.returncode,-signal.SIGKILL,result.stderr)
         self.assertIsNotNone(args)

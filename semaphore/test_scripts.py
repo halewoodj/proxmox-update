@@ -18,10 +18,16 @@ VERSION = subprocess.check_output([BASH,'--version'],text=True)
 BASH_MAJOR = int(re.search(r'version (\d+)',VERSION).group(1))
 
 SSH = '''#!/usr/bin/env python3
-import json,os,shlex,subprocess,sys,signal
+import base64,json,os,shlex,subprocess,sys,signal
 node=next(a for a in sys.argv if a.startswith('root@')).split('@')[1]
 command=sys.argv[-1]
 tokens=shlex.split(command)
+if tokens[0]=='systemd-run':
+ command=base64.b64decode(tokens[-1]).decode()
+elif '--inspect' in tokens:
+ token=tokens[tokens.index('--inspect')+1]
+ print(json.dumps({'unit':'pve-update-'+token+'.service','properties':{'LoadState':'not-found'},'pids':[],'quiescent':True}))
+ sys.exit(0)
 if 'bash' in tokens and '-lc' in tokens: command=tokens[-1]
 with open(os.environ['TEST_COMMAND_LOG'],'a') as f: f.write(json.dumps(command)+'\\n')
 with open(os.environ['TEST_NODE_LOG'],'a') as f: f.write(json.dumps({'node':node,'command':command})+'\\n')
@@ -86,6 +92,12 @@ elif '-s dist-upgrade' in command:
  if not os.environ.get('TEST_NO_CHANGES'):print('Inst example [1] (2 repo [amd64])')
  if os.environ.get('TEST_REMOVAL'):print('Remv proxmox-ve [9.2]')
 elif '--no-remove dist-upgrade' in command:
+ if os.environ.get('TEST_CANCEL_APT'):
+  signal.signal(signal.SIGHUP,signal.SIG_IGN)
+  open(os.environ['TEST_FIXTURE']+'.apt-started','w').close()
+  for line in sys.stdin.buffer:pass
+  open(os.environ['TEST_FIXTURE']+'.apt-cancelled','w').close()
+  sys.exit(130)
  if os.environ.get('TEST_UPGRADE_FAIL'):
   print('dpkg exact failure diagnostic',file=sys.stderr);sys.exit(100)
  open(os.environ['TEST_FIXTURE']+'.installed.'+node,'w').close()
@@ -136,12 +148,14 @@ class ScriptTests(unittest.TestCase):
             if extra.get('TEST_PARALLEL'):args.extend(['--jobs','2'])
             if extra.get('TEST_AUTO'):args.append('--auto-maintenance')
             if filename=='rolling-reboot.sh': args.extend(['--yes','--direct-node-ssh','--ceph-timeout','1'])
-            if extra.get('TEST_CANCEL'):
+            if extra.get('TEST_CANCEL') or extra.get('TEST_CANCEL_APT'):
                 process=subprocess.Popen(args,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
                 try:
                     deadline=time.monotonic()+15
                     while time.monotonic()<deadline:
-                        if log.exists() and 'node-maintenance enable' in log.read_text():break
+                        if extra.get('TEST_CANCEL_APT'):
+                            if Path(str(fixture)+'.apt-started').exists():break
+                        elif log.exists() and 'node-maintenance enable' in log.read_text():break
                         time.sleep(.05)
                     else:self.fail('Maintenance preparation did not start')
                     process.send_signal(signal.SIGTERM)
@@ -155,7 +169,13 @@ class ScriptTests(unittest.TestCase):
             self.node_commands=[json.loads(line) for line in nodes.read_text().splitlines()] if nodes.exists() else []
             # The script deliberately retains evidence. Test fixtures can be removed.
             match=re.search(r'Diagnostic logs and summaries: (.+)',result.stdout)
-            if match:shutil.rmtree(match[1],ignore_errors=True)
+            self.package_cancelled=Path(str(fixture)+'.apt-cancelled').exists()
+            self.remote_states=[];self.maintenance_states=[]
+            if match:
+                diagnostic=Path(match[1])
+                self.remote_states=[json.loads(p.read_text()) for p in diagnostic.glob('*.apt.*.json')]
+                self.maintenance_states=[json.loads(p.read_text()) for p in diagnostic.glob('*.maintenance.json')]
+                shutil.rmtree(match[1],ignore_errors=True)
             return result, commands
 
     @unittest.skipUnless((ROOT/'update.sh').exists() and BASH_MAJOR>=4,'requires updater and Bash 4+')
@@ -285,6 +305,17 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode,130,result.stdout+result.stderr)
         self.assertFalse(any('--no-remove dist-upgrade' in c or 'node-maintenance disable' in c for c in commands))
         self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_cancelling_package_work_verifies_stop_and_preserves_hold_before_exit(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_CANCEL_APT='1')
+        self.assertEqual(result.returncode,130,result.stdout+result.stderr)
+        self.assertTrue(self.package_cancelled,'Remote lease was not revoked')
+        self.assertTrue(any(s['phase']=='quiescent' and s['quiescent'] and s['cancelled']
+                            for s in self.remote_states))
+        self.assertEqual([s['phase'] for s in self.maintenance_states],['prepared'])
+        self.assertFalse(any('systemctl unmask' in c or 'node-maintenance disable' in c for c in commands))
+        self.assertFalse(any(x['node']=='NODE-2' and ('apt-get' in x['command'] or 'node-maintenance enable' in x['command']) for x in self.node_commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_missing_worker_summary_and_failed_verification_stop_queue(self):

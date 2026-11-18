@@ -129,16 +129,18 @@ def run_script(argv,env,lock_fd):
         # forward that cancellation to Bash workers, helpers and SSH children.
         # Keep the maintenance lock in the worker too: killing only the runner
         # must not permit a second job while the original worker is still alive.
-        process=subprocess.Popen(argv,env=env,start_new_session=True,pass_fds=(lock_fd,))
+        guarded=[sys.executable,str(ROOT/'semaphore/parent_guard.py'),str(os.getpid()),*argv]
+        process=subprocess.Popen(guarded,env=env,start_new_session=True,pass_fds=(lock_fd,))
         if interrupted:stop(signal.SIGTERM,None)
         while True:
             try:
                 result=process.wait(timeout=1)
                 break
             except subprocess.TimeoutExpired:
-                if interrupted and time.monotonic()-interrupted[0]>20:
-                    try:os.killpg(process.pid,signal.SIGKILL)
-                    except ProcessLookupError:pass
+                # Package I/O may be uninterruptible. Keep the lock and SSH
+                # material while helpers verify the owned remote unit; killing
+                # them after an arbitrary grace period would erase that proof.
+                continue
         if interrupted:
             try:os.killpg(process.pid,signal.SIGTERM)
             except ProcessLookupError:pass

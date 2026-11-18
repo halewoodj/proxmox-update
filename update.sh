@@ -207,12 +207,23 @@ maintenance_step() {
 
 remote_logged() {
   local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" LABEL="$4" RC
-  remote_run "$NODE" "$TIMEOUT_SECONDS" "$COMMAND" >> "$TMP_DIR/$NODE.log" 2>&1
+  remote_package "$NODE" "$TIMEOUT_SECONDS" "$COMMAND" >> "$TMP_DIR/$NODE.log" 2>&1
   RC=$?
   if [ "$RC" -ne 0 ]; then
     printf '[%s] %s failed (exit %s). Last output:\n' "$NODE" "$LABEL" "$RC" >&2
     tail -n 60 "$TMP_DIR/$NODE.log" >&2
   fi
+  return "$RC"
+}
+
+remote_package() {
+  local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" RC
+  python3 "$SCRIPT_DIR/semaphore/remote_apt.py" --node "$NODE" \
+    --timeout "$TIMEOUT_SECONDS" --directory "$TMP_DIR" -- "$COMMAND" &
+  ACTIVE_HELPER_PID=$!
+  wait "$ACTIVE_HELPER_PID"
+  RC=$?
+  ACTIVE_HELPER_PID=""
   return "$RC"
 }
 
@@ -353,13 +364,16 @@ update_node() {
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -s dist-upgrade" 2> "$TMP_DIR/$NODE.simulation.log")
-  if [ $? -ne 0 ]; then
+  # Keep the helper PID in this worker, including during preview. A command
+  # substitution would hide its PID from the worker's cancellation trap.
+  if ! remote_package "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -s dist-upgrade" \
+      > "$TMP_DIR/$NODE.simulation.out" 2> "$TMP_DIR/$NODE.simulation.log"; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
     cat "$TMP_DIR/$NODE.simulation.log" >&2
     return 1
   fi
+  UPGRADE_SIM=$(cat "$TMP_DIR/$NODE.simulation.out")
 
   INST_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Inst / {printf "%s ", $2}' | sed 's/ *$//')
   REMV_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Remv / {printf "%s ", $2}' | sed 's/ *$//')
