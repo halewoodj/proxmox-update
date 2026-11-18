@@ -56,9 +56,12 @@ def verify_recovery(nodes, data, boots, repair=None):
             raise ValueError('Unexpected reboot on '+node)
         if row['audit'] and repair and node == repair[0]:
             # Exact audit, not arbitrary broken dependency or dpkg overrides.
-            lines = row['audit'].splitlines()
-            packages = [line.split()[0] for line in lines if line.startswith(' ')]
-            if packages != [repair[1]]:
+            primary, marker, triggered = row['audit'].partition(
+                'The following packages have been triggered, but the trigger processing')
+            packages = [line.split()[0] for line in primary.splitlines() if line.startswith(' ')]
+            triggers = [line.split()[0] for line in triggered.splitlines() if line.startswith(' ')]
+            if (packages not in [[], [repair[1]]] or not (packages or triggers)
+                    or any(p != 'pve-manager' for p in triggers)):
                 raise ValueError('Unreviewed package damage on '+node+': '+row['audit'])
             row['audit'] = ''
     baseline = cluster_baseline(checked)
@@ -96,6 +99,10 @@ def plan_packages(output, *, complete=True):
 def recover_cached_archive(package, root=Path('/var/cache/apt/archives'),
                            query=subprocess.check_output, execute=subprocess.run):
     """Use the already APT-downloaded archive to replay dpkg's interrupted unpack."""
+    status = query(['dpkg-query','-W','-f=${db:Status-Abbrev}',package],text=True).strip()
+    if 'R' not in status:
+        print('Interrupted unpack already replayed; proceed to dependency repair.',flush=True)
+        return
     installed = query(['dpkg-query','-W','-f=${Version}',package],text=True).strip()
     selected = None
     selected_version = installed
@@ -201,7 +208,7 @@ def worker(args):
         package(node, directory, 'Refresh APT metadata', APT+'-o APT::Update::Error-Mode=any update', 1800)
         if node == args.resume_node:
             package(node, directory, 'Recover interrupted dpkg unpack', archive_recovery_command(args.repair_package))
-            fix = '--fix-broken --no-remove --reinstall install '+shlex.quote(args.repair_package)
+            fix = '--fix-broken --no-remove install'
             plan_packages(package(node, directory, 'Simulate package recovery', APT+'-s '+fix, 1800), complete=False)
             package(node, directory, 'Recover interrupted package', APT+'-y '+fix)
             data, baseline = recovered(nodes, boots, directory, node+'-repaired')

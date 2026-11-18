@@ -96,7 +96,7 @@ class OperatorTests(unittest.TestCase):
         archive=Path(self.tmp.name)/'libpve-notify-perl_9.1.10_all.deb';archive.touch()
         calls=[]
         def query(args,**kw):
-            if args[0]=='dpkg-query':return '9.1.9'
+            if args[0]=='dpkg-query':return 'iUR' if 'Status-Abbrev' in args[-2] else '9.1.9'
             return 'libpve-notify-perl' if args[-1]=='Package' else '9.1.10'
         def execute(args,**kw):calls.append((args,kw));return SimpleNamespace(returncode=0)
         recover_cached_archive('libpve-notify-perl',Path(self.tmp.name),query,execute)
@@ -108,11 +108,24 @@ class OperatorTests(unittest.TestCase):
                 if case!='missing':(Path(tmp)/'libpve-notify-perl_1_all.deb').touch()
                 calls=[]
                 def query(args,**kw):
-                    if args[0]=='dpkg-query':return '9.1.9'
+                    if args[0]=='dpkg-query':return 'iUR' if 'Status-Abbrev' in args[-2] else '9.1.9'
                     return 'wrong-package' if case=='wrong' else ('libpve-notify-perl' if args[-1]=='Package' else '1')
                 def execute(args,**kw):calls.append(args);return SimpleNamespace(returncode=1)
                 with self.assertRaises(ValueError):recover_cached_archive('libpve-notify-perl',Path(tmp),query,execute)
                 self.assertFalse(any('--unpack' in a for a in calls))
+
+    def test_replayed_archive_is_not_unpacked_twice(self):
+        def query(args,**kw):return 'iU '
+        def execute(args,**kw):self.fail('No package command is needed')
+        recover_cached_archive('libpve-notify-perl',Path(self.tmp.name),query,execute)
+
+    def test_only_the_known_pending_manager_trigger_is_allowed_with_repair(self):
+        self.data['NODE-1']['audit']='Unpacked packages:\n libpve-notify-perl Notify module.\n\nThe following packages have been triggered, but the trigger processing\nhas not yet been done:\n pve-manager Manager.'
+        verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
+        self.data['NODE-1']['audit']=self.data['NODE-1']['audit'].replace('pve-manager','unknown-package')
+        with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
+        self.data['NODE-1']['audit']='Reinstall these packages:\n libpve-notify-perl Notify module.\n pve-manager Manager.'
+        with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
 
 
 if __name__=='__main__':unittest.main()
