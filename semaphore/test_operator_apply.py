@@ -124,6 +124,13 @@ class OperatorTests(unittest.TestCase):
         verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
         self.data['NODE-1']['audit']=self.data['NODE-1']['audit'].replace('pve-manager','unknown-package')
         with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
+
+    def test_interrupted_kernel_plan_and_standard_triggers_can_resume(self):
+        self.data['NODE-1']['audit']='Packages requiring reinstallation:\n proxmox-kernel-test damaged\n\nUnpacked packages:\n pve-manager manager\n\nThe following packages have been triggered, but the trigger processing\nhas not finished:\n dbus bus\n systemd service manager\n\nMissing control files:\n proxmox-kernel-test damaged'
+        repair=('NODE-1',['proxmox-kernel-test','pve-manager'])
+        verify_recovery(self.nodes,self.data,self.boots,repair)
+        self.data['NODE-1']['audit']+='\n\nPackages requiring reinstallation:\n dbus damaged'
+        with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,repair)
         self.data['NODE-1']['audit']='Reinstall these packages:\n libpve-notify-perl Notify module.\n pve-manager Manager.'
         with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
 

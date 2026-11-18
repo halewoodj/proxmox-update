@@ -56,13 +56,19 @@ def verify_recovery(nodes, data, boots, repair=None):
             raise ValueError('Unexpected reboot on '+node)
         if row['audit'] and repair and node == repair[0]:
             # Exact audit, not arbitrary broken dependency or dpkg overrides.
-            primary, marker, triggered = row['audit'].partition(
-                'The following packages have been triggered, but the trigger processing')
-            packages = [line.split()[0] for line in primary.splitlines() if line.startswith(' ')]
-            triggers = [line.split()[0] for line in triggered.splitlines() if line.startswith(' ')]
-            if (packages not in [[], [repair[1]]] or not (packages or triggers)
-                    or any(p != 'pve-manager' for p in triggers)):
-                raise ValueError('Unreviewed package damage on '+node+': '+row['audit'])
+            allowed = {repair[1]} if isinstance(repair[1],str) else set(repair[1])
+            trigger_packages = {'dbus','man-db','procps','systemd','pve-manager','pve-ha-manager'}
+            found = False
+            for paragraph in row['audit'].split('\n\n'):
+                packages = {line.split()[0] for line in paragraph.splitlines() if line.startswith(' ')}
+                if not packages:continue
+                found = True
+                permitted = trigger_packages if paragraph.startswith(
+                    'The following packages have been triggered, but the trigger processing') else allowed
+                if not packages <= permitted:
+                    raise ValueError('Unreviewed package damage on '+node+': '+row['audit'])
+            if not found:
+                raise ValueError('Unrecognized package audit on '+node)
             row['audit'] = ''
     baseline = cluster_baseline(checked)
     verify_cluster(nodes, checked, baseline)
@@ -120,7 +126,8 @@ def recover_cached_archive(package, root=Path('/var/cache/apt/archives'),
 
 def archive_recovery_command(package):
     code = 'import subprocess\nfrom pathlib import Path\n'+inspect.getsource(recover_cached_archive)
-    code += '\nrecover_cached_archive('+repr(package)+')\n'
+    packages = [package] if isinstance(package,str) else package
+    code += '\nfor package in '+repr(packages)+':\n recover_cached_archive(package)\n'
     return shlex.join(['nice','-n','19','ionice','-c','3','python3','-c',code])
 
 
@@ -179,7 +186,9 @@ def worker(args):
     for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
         signal.signal(sig, stop)
     nodes = run.inventory(os.environ['PVE_NODES_JSON'])
-    selected = list(nodes)
+    selected = run.selected_nodes(nodes, args.nodes)
+    if args.resume_node not in selected:
+        raise ValueError('Resume node must be selected')
     data = collect(nodes)
     boots = {n:d['boot_id'] for n,d in data.items()}
     repair = (args.resume_node, args.repair_package)
@@ -207,7 +216,8 @@ def worker(args):
         print('OPERATOR PROTECTED='+node, flush=True)
         package(node, directory, 'Refresh APT metadata', APT+'-o APT::Update::Error-Mode=any update', 1800)
         if node == args.resume_node:
-            package(node, directory, 'Recover interrupted dpkg unpack', archive_recovery_command(args.repair_package))
+            package(node, directory, 'Recover interrupted dpkg unpack',
+                    archive_recovery_command(args.repair_package))
             fix = '--fix-broken --no-remove install'
             plan_packages(package(node, directory, 'Simulate package recovery', APT+'-s '+fix, 1800), complete=False)
             package(node, directory, 'Recover interrupted package', APT+'-y '+fix)
@@ -237,9 +247,13 @@ def main():
     parser.add_argument('--acknowledge-storage-stalls', action='store_true', required=True)
     parser.add_argument('--resume-node', required=True)
     parser.add_argument('--resume-state', required=True)
-    parser.add_argument('--repair-package', choices=['libpve-notify-perl'], required=True)
+    parser.add_argument('--repair-package', action='append', required=True,
+                        help='Repeat for reviewed packages in the interrupted update plan')
+    parser.add_argument('--nodes', help='Remaining comma-separated rollout nodes')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if any(not re.fullmatch(r'[a-z0-9][a-z0-9+.-]+',p) for p in args.repair_package):
+        raise ValueError('Invalid recovery package name')
     os.umask(0o077)
     if args.worker:
         return worker(args)
