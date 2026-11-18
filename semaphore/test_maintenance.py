@@ -212,6 +212,18 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.cluster.commands,[])
         self.assertFalse(self.path.exists())
 
+    def test_managed_start_stop_tasks_settle_but_unmanaged_operations_block(self):
+        for kind,prefix in [('qmstart','vm:'),('qmstop','vm:'),('qmshutdown','vm:'),
+                            ('vzstart','ct:'),('vzstop','ct:'),('vzshutdown','ct:')]:
+            with self.subTest(kind=kind):
+                data=copy.deepcopy(self.cluster.data)
+                for d in data.values():d['ha_config'].append({'sid':prefix+'100'})
+                data['NODE-2']['active_tasks']=[{'type':kind,'id':'100'}]
+                with self.assertRaises(MaintenancePending):check_plan(list(data),'NODE-1',data)
+                data['NODE-2']['active_tasks'][0]['id']='999'
+                with self.assertRaisesRegex(ValueError,'Active Proxmox tasks'):
+                    check_plan(list(data),'NODE-1',data)
+
     def test_safety_regression_while_waiting_still_aborts_immediately(self):
         for scenario in ['ceph','epoch','quorum','reboot','service-error']:
             with self.subTest(scenario=scenario):
