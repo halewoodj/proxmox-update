@@ -73,7 +73,7 @@ elif '--no-remove dist-upgrade' in command:
  if os.environ.get('TEST_UPGRADE_FAIL'):
   print('dpkg exact failure diagnostic',file=sys.stderr);sys.exit(100)
  open(os.environ['TEST_FIXTURE']+'.installed.'+node,'w').close()
-elif command=='pveversion':
+elif command.startswith('dpkg-query -W '):
  if os.environ.get('TEST_BAD_VERSION'):sys.exit(255)
  print('pve-manager/test')
 elif command=='uname -r': print('6.8.1-pve')
@@ -192,7 +192,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         indices={key:next(i for i,c in enumerate(commands) if key in c) for key in [
             'node-maintenance enable','systemctl stop','systemctl mask','APT::Update::Error-Mode=any update','--no-remove dist-upgrade',
-            'pveversion','systemctl unmask','systemctl start','node-maintenance disable']}
+            'dpkg-query -W','systemctl unmask','systemctl start','node-maintenance disable']}
         self.assertEqual(list(indices.values()),sorted(indices.values()))
         self.assertTrue(all('Dir::Cache::pkgcache=' in c and 'Dir::Cache::srcpkgcache=' in c
                             for c in commands if 'apt-get' in c))

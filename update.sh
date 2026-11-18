@@ -422,7 +422,9 @@ update_node() {
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
-  if ! PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'pveversion') || [ -z "$PVEVERSION" ] ||
+  # pveversion consults APT and can rebuild its disk cache. Query dpkg directly
+  # so a preview/version check cannot recreate that large boot-disk write burst.
+  if ! PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" "dpkg-query -W -f='\${binary:Package}/\${Version}' pve-manager") || [ -z "$PVEVERSION" ] ||
      ! RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r') || [ -z "$RKERNEL" ] ||
      ! LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
        "set -o pipefail; ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -n1") || [ -z "$LKERNEL" ]; then
