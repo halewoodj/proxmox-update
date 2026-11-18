@@ -105,7 +105,7 @@ def script_args(mode, control, selected):
     args = ['bash', str(ROOT / PROGRAM), '--cluster-host', 'root@' + control,
             '--nodes', ','.join(selected)]
     if PROGRAM == 'update.sh':
-        args.extend(['--jobs', '1'])
+        args.extend(['--jobs', '1', '--auto-maintenance'])
     else:
         args.extend(['--direct-node-ssh', '--yes'])
     if mode == 'preview':
@@ -139,6 +139,9 @@ def main():
             print(f'Mode: {args.mode}; selected nodes: {", ".join(selected)}', flush=True)
             if PROGRAM == 'update.sh' and args.mode == 'preview':
                 print('Preview refreshes APT metadata and simulates upgrades; no packages are changed.', flush=True)
+                print('Automatic HA maintenance is planned only; preview does not migrate guests or change services.', flush=True)
+            elif PROGRAM == 'update.sh':
+                print('Apply prepares one HA node at a time, then restores it after verification. Container migration can restart containers.', flush=True)
             return subprocess.call(script_args(args.mode, control, selected), env=env)
 
 

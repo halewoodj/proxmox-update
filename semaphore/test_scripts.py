@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from test_update_guard import healthy
 
@@ -32,6 +34,24 @@ if command.startswith('python3 -c '):
  if os.environ.get('TEST_POST_REBOOT') and count>=3: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
  if os.environ.get('TEST_POST_CEPH') and count>=3:data['ceph']['health']['status']='HEALTH_WARN'
  print(json.dumps(data))
+elif command.startswith('timeout --preserve-status 90s '):
+ args=tokens[3:]
+ if os.environ.get('TEST_CANCEL') and args[0]=='ha-manager':
+  import time;time.sleep(20)
+ if os.environ.get('TEST_PREP_FAIL') and args[0]=='ha-manager':
+  print('injected evacuation refusal',file=sys.stderr);sys.exit(1)
+ fixture=json.load(open(os.environ['TEST_FIXTURE']))
+ if args[0]=='ha-manager':
+  enable=args[-2]=='enable'
+  for d in fixture.values():
+   d['manager']={'node_request':{node:{'maintenance':1}}} if enable else {}
+   old,new=('active, watchdog active','maintenance, watchdog standby') if enable else ('maintenance, watchdog standby','active, watchdog active')
+   d['ha']=d['ha'].replace('lrm '+node+' ('+old,'lrm '+node+' ('+new)
+ elif args[1]=='stop':fixture[node].update(crm_active='inactive',watchdog_active=False)
+ elif args[1]=='mask':fixture[node]['crm_unit']='masked-runtime'
+ elif args[1]=='unmask':fixture[node]['crm_unit']='enabled'
+ elif args[1]=='start':fixture[node]['crm_active']='active'
+ with open(os.environ['TEST_FIXTURE'],'w') as f:json.dump(fixture,f)
 elif command=='true' or command.startswith('command -v '):
  if command=='true' and os.environ.get('TEST_LOST_WORKER'):
   os.kill(os.getppid(),signal.SIGKILL)
@@ -74,7 +94,14 @@ class ScriptTests(unittest.TestCase):
                 p.write_text('#!/bin/sh\nif [ "$TEST_LIST_FAILURE" = "'+kind+'" ]; then exit 1; fi\nexit 0\n')
                 p.chmod(0o700)
             log=tmp/'commands.jsonl'
-            fixture=tmp/'fixture.json';fixture.write_text(json.dumps(healthy()))
+            fixture=tmp/'fixture.json';data=healthy()
+            if extra.get('TEST_AUTO'):
+                for d in data.values():
+                    d.update(manager={},active_tasks=[],ha_config=[{'sid':'vm:100'}],crm_commands='')
+                    d['ha']=d['ha'].replace('maintenance, watchdog standby','active, watchdog active')
+                    d['resources']=[{'type':'node','node':n,'maxmem':64*1024**3,'mem':8*1024**3} for n in data]
+                data['NODE-1'].update(crm_active='active',crm_unit='enabled',watchdog_active=True)
+            fixture.write_text(json.dumps(data))
             nodes=tmp/'nodes.jsonl'
             env=os.environ.copy()
             env.update(PATH=str(tmp)+os.pathsep+env['PATH'],TEST_COMMAND_LOG=str(log),
@@ -83,8 +110,23 @@ class ScriptTests(unittest.TestCase):
                   '--nodes',extra.get('TEST_SELECTED','NODE-1,NODE-2')]
             if not extra.get('TEST_APPLY'):args.append('--dry-run')
             if extra.get('TEST_PARALLEL'):args.extend(['--jobs','2'])
+            if extra.get('TEST_AUTO'):args.append('--auto-maintenance')
             if filename=='rolling-reboot.sh': args.extend(['--yes','--direct-node-ssh','--ceph-timeout','1'])
-            result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=30)
+            if extra.get('TEST_CANCEL'):
+                process=subprocess.Popen(args,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                try:
+                    deadline=time.monotonic()+15
+                    while time.monotonic()<deadline:
+                        if log.exists() and 'node-maintenance enable' in log.read_text():break
+                        time.sleep(.05)
+                    else:self.fail('Maintenance preparation did not start')
+                    process.send_signal(signal.SIGTERM)
+                    stdout,stderr=process.communicate(timeout=10)
+                    result=subprocess.CompletedProcess(args,process.returncode,stdout,stderr)
+                finally:
+                    if process.poll() is None:process.kill();process.communicate()
+            else:
+                result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=30)
             commands=[json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             self.node_commands=[json.loads(line) for line in nodes.read_text().splitlines()] if nodes.exists() else []
             # The script deliberately retains evidence. Test fixtures can be removed.
@@ -137,6 +179,39 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),1)
         self.assertFalse(any('autoremove' in c or 'apt-get clean' in c for c in commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_automatic_apply_prepares_before_install_and_restores_after_verification(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_SELECTED='NODE-1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        indices={key:next(i for i,c in enumerate(commands) if key in c) for key in [
+            'node-maintenance enable','systemctl stop','systemctl mask','--no-remove dist-upgrade',
+            'pveversion','systemctl unmask','systemctl start','node-maintenance disable']}
+        self.assertEqual(list(indices.values()),sorted(indices.values()))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_automatic_preparation_or_package_failure_never_restores_or_continues(self):
+        for scenario in ['TEST_PREP_FAIL','TEST_UPGRADE_FAIL']:
+            with self.subTest(scenario=scenario):
+                result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
+                self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+                if scenario=='TEST_PREP_FAIL':self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
+                self.assertFalse(any('node-maintenance disable' in c or 'systemctl unmask' in c for c in commands))
+                self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_automatic_preview_only_prints_maintenance_plan(self):
+        result,commands=self.run_script('update.sh',TEST_AUTO='1',TEST_SELECTED='NODE-1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('Plan only',result.stdout)
+        self.assertFalse(any('node-maintenance' in c or 'systemctl mask' in c or '--no-remove dist-upgrade' in c for c in commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_cancelling_preparation_never_starts_install_or_next_node(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_CANCEL='1')
+        self.assertEqual(result.returncode,130,result.stdout+result.stderr)
+        self.assertFalse(any('--no-remove dist-upgrade' in c or 'node-maintenance disable' in c for c in commands))
+        self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_missing_worker_summary_and_failed_verification_stop_queue(self):

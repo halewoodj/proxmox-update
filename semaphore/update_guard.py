@@ -33,6 +33,11 @@ print(json.dumps({
     'crm_active':read(['systemctl','show','pve-ha-crm','-p','ActiveState','--value']),
     'crm_unit':read(['systemctl','show','pve-ha-crm','-p','UnitFileState','--value']),
     'resources':json.loads(read(['pvesh','get','/cluster/resources','--output-format','json'])),
+    'ha_config':json.loads(read(['pvesh','get','/cluster/ha/resources','--output-format','json'])),
+    'manager':json.loads(pathlib.Path('/etc/pve/ha/manager_status').read_text()),
+    'active_tasks':json.loads(read(['pvesh','get','/nodes/'+socket.gethostname().split('.')[0]+'/tasks','--source','active','--output-format','json'])),
+    'watchdog_active':pathlib.Path('/run/watchdog-mux.active').exists(),
+    'crm_commands':pathlib.Path('/etc/pve/ha/crm_commands').read_text() if pathlib.Path('/etc/pve/ha/crm_commands').exists() else '',
 }))
 '''
 
@@ -60,8 +65,10 @@ def verify_cluster(expected, snapshots, baseline=None):
         if not (osds['num_osds'] == osds['num_up_osds'] == osds['num_in_osds']):
             raise ValueError('Ceph has missing OSDs on ' + node)
         pgmap = ceph['pgmap']
+        safe_states = {'active', 'clean', 'scrubbing', 'deep'}
         if pgmap['num_pgs'] < 1 or sum(s['count'] for s in pgmap['pgs_by_state']
-                                     if s['state_name'] == 'active+clean') != pgmap['num_pgs']:
+                                     if {'active','clean'} <= set(s['state_name'].split('+'))
+                                     <= safe_states) != pgmap['num_pgs']:
             raise ValueError('Ceph placement groups are not all active+clean on ' + node)
         if data['audit']:
             raise ValueError('Unfinished package configuration on ' + node + ': ' + data['audit'])
@@ -79,7 +86,13 @@ def verify_target(node, snapshots):
     target = snapshots[node]
     if target['crm_active'] != 'inactive' or target['crm_unit'] not in ['masked','masked-runtime']:
         raise ValueError(node + ' CRM must be gracefully stopped and temporarily masked on the evacuated node')
+    if target.get('watchdog_active', True):
+        raise ValueError(node + ' watchdog multiplexer still has active clients')
     for observer, data in snapshots.items():
+        if not data['manager'].get('node_request',{}).get(node,{}).get('maintenance'):
+            raise ValueError(node + ' HA maintenance request is not retained on ' + observer)
+        if data['crm_commands'].strip():
+            raise ValueError('Pending HA commands on ' + observer + '; wait before installing')
         ha = data['ha']
         if not ha.startswith('quorum OK\n'):
             raise ValueError('HA status incomplete on ' + observer)

@@ -71,6 +71,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(args[args.index('--cluster-host')+1], 'root@NODE-1')
         if (ROOT / 'update.sh').exists():
             self.assertEqual(args[args.index('--jobs')+1], '1')
+            self.assertIn('--auto-maintenance',args)
         else:
             self.assertIn('--direct-node-ssh', args)
             self.assertIn('--yes', args)

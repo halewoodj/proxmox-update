@@ -31,6 +31,7 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 - A Proxmox VE cluster node.
 - Bash 4 or newer.
 - Root privileges.
+- Python 3 on the controller and every node.
 - `pvecm` on the local Proxmox node, or on the remote node selected with `--cluster-host`.
 - SSH key-based root login from the controller to every cluster node.
 - Working Proxmox/Debian package repositories on each node.
@@ -96,40 +97,60 @@ The script does not initiate reboots. An active HA watchdog can still reset an
 unsafe host, so apply now requires the maintenance conditions below. Unexpected
 boot-ID changes stop the queue even when cluster health has already recovered.
 
-### Preparing a node for package installation
+### Automatic HA preparation in Semaphore
 
-Apply is fail-closed. It does **not** evacuate guests, change HA settings, stop
-services, or release watchdogs on the operator’s behalf. Preview remains usable
-on active nodes. Use `--nodes <prepared-node>` for each installation window.
+Semaphore preview plans HA preparation when packages are pending. It does not
+migrate guests, change services, install packages or reboot nodes. Semaphore apply
+uses `--auto-maintenance` to process one node at a time:
 
-Before apply, prepare one node at a time:
+1. Refresh metadata and simulate packages before moving any guests. Nodes without
+   package changes need no evacuation.
+2. Verify healthy peers, memory headroom, stable HA services and no conflicting
+   Proxmox tasks or pending HA commands. Running guests outside HA require manual
+   evacuation; the script does not guess their destination or storage options.
+3. Request HA node maintenance and wait for all running guests to leave and for
+   the LRM watchdog to be released. HA respects its placement/storage rules;
+   migration refusal or timeout stops the run. Container migrations can briefly
+   restart containers.
+4. Gracefully stop the target CRM, wait for master handover when necessary and
+   verify all local watchdog clients have closed. Add a runtime CRM mask to keep
+   package triggers from starting it during installation.
+5. Recheck cluster health, boot IDs, package state and the prepared target, then
+   install with `--no-remove`. Preserve APT output and verify the result.
+6. Remove only the mask introduced by this run, restore the CRM service's prior
+   active state, release only maintenance introduced by this run and wait for HA
+   actions and cluster health to settle before starting the next node.
 
-1. Enable its HA node maintenance with
-   `ha-manager crm-command node-maintenance enable <node>`. Review migration
-   constraints and capacity first; container migration can involve a restart.
-2. Wait for all HA migrations and workers to finish and the LRM watchdog to be
-   released. The word `maintenance` alone is insufficient. Evacuate remaining
-   non-HA guests as well.
-3. Gracefully stop that node’s CRM with `systemctl stop pve-ha-crm`, verify a
-   healthy CRM is active on another node, then keep the stopped service from
-   being restarted by package triggers with
-   `systemctl mask --runtime pve-ha-crm`. Never kill HA daemons or watchdog-mux.
-4. Run apply for the prepared node. The guard checks the entire detected cluster,
-   including nodes excluded from package installation. It also requires all Ceph
-   OSDs up/in, every placement group active+clean, fresh HA heartbeats, and no
-   incomplete/locked package database on any node. APT package removals require
-   separate review and are refused.
-5. After a successful update and health checks, remove only the runtime mask you
-   introduced (`systemctl unmask --runtime pve-ha-crm`), start the CRM, verify HA,
-   then disable node maintenance to allow HA guests to return. Preserve any
-   pre-existing masks/maintenance settings. Handle a required reboot separately.
+The controller retains a private `<node>.maintenance.json` recovery record in
+its printed diagnostic directory, recording original settings and each intended
+change before issuing it. Pre-existing maintenance and masks are preserved. On
+failure or interruption it stops the queue and leaves preparation in place for
+inspection. It does not blindly release maintenance after an uncertain or failed
+package operation. Check remote APT/dpkg and that recovery record before retrying;
+restore the recorded original settings only after validating node health.
 
-On failure, leave the node prepared for maintenance and investigate using the
-printed diagnostic directory. Do not retry while any remote APT/dpkg operation
-is still active. The updater never disarms HA cluster-wide.
+For the same automatic flow from a Linux controller:
 
-The checks reduce the risks seen in the incident; they do not establish why an
-HA process previously stopped responding or prove that a future package is safe.
+```bash
+./update.sh --auto-maintenance --cluster-host root@pve1 --dry-run
+./update.sh --auto-maintenance --cluster-host root@pve1
+```
+
+Direct `update.sh` without `--auto-maintenance` retains manual preparation mode.
+For one selected node, enable HA node maintenance, wait for evacuation and LRM
+watchdog release, gracefully stop its CRM and apply a runtime mask, then run
+`./update.sh --nodes <prepared-node>`. After success, restore only settings you
+introduced. Never kill HA daemons or watchdog-mux.
+
+All modes check every detected cluster member, including nodes excluded from
+installation. They require quorum, fresh HA heartbeats, no boot-ID changes,
+clean/unlocked package databases, Ceph HEALTH_OK with no muted checks, every OSD
+up/in and all PGs active+clean. Normal scrub/deep-scrub flags are permitted;
+recovery, degradation, remapping and unknown states still block the operation.
+The updater never disarms HA cluster-wide or requests a host reboot.
+
+These controls address unsafe updating of active HA nodes. The underlying cause
+of the previous CRM/LRM stalls is still under investigation.
 
 ## Rolling Reboots
 
@@ -202,7 +223,7 @@ If the node running the script is selected for reboot, it is moved to the end of
 
 ## Important Notes
 
-The script updates one node at a time unless you pass `--jobs` or `--parallel`. Increasing concurrency can be useful in lab clusters or planned maintenance windows, but it may be risky for production clusters if multiple nodes host critical guests, storage services, or quorum-sensitive workloads.
+Apply always updates one node at a time. `--jobs` and `--parallel` change preview concurrency only.
 
 The script uses `apt-get -y dist-upgrade`, following Proxmox's documented CLI update path. Package prompts are answered automatically where possible, but repository issues, held packages, broken dependencies, or interactive maintainer prompts can still cause failures.
 
@@ -210,7 +231,7 @@ Package commands run with `DEBIAN_FRONTEND=noninteractive` and dpkg options that
 
 SSH commands use batch mode, a 10-second connection timeout, one connection attempt, and server-alive checks to detect dead SSH sessions. Remote commands are also wrapped with `timeout`: quick checks use 120 seconds, package update and maintenance steps use 1800 seconds, and `dist-upgrade` uses 7200 seconds.
 
-If `apt-get update` or the upgrade simulation fails on a node, that node is skipped for the remaining upgrade steps and reported as failed in the final summary. If `dist-upgrade` fails, the script stops package maintenance for that node instead of continuing to `autoremove` or `clean`. Failures from later maintenance steps are also reported in the summary.
+Any failed worker, missing summary, failed package operation or failed verification stops the queue. Later nodes are reported as SKIPPED. Package cleanup is separate from updating; the transaction does not run autoremove or clean.
 
 In dry-run mode, the script still runs `apt-get update`, upgrade simulation, and reboot checks on selected nodes. It does not run `dist-upgrade`, `autoremove`, or `clean`.
 
@@ -276,12 +297,13 @@ lock so update and reboot tasks cannot overlap on the same runner. Give this
 project only to operators authorised to maintain those hypervisors. Restrict the
 key to the Semaphore controller's source IP and disable forwarding and PTY access.
 
-The updater runs from Semaphore with `--jobs 1`. **Preview** refreshes APT
-metadata, simulates upgrades and reports kernel/reboot status; it does not install,
-remove or clean packages. **Apply** refuses installation until the target meets
-the preparation requirements above. Neither mode initiates reboots. Keep the
-release pinned and configure the apply template’s `--nodes` argument for the
-prepared node; do not enable unrestricted task argument overrides.
+The updater runs from Semaphore with `--jobs 1 --auto-maintenance`. **Preview**
+refreshes APT metadata, simulates packages and prints the automatic maintenance
+plan; it does not move guests or change HA/services. **Apply** prepares and restores
+one node at a time as described above. Container migration can restart containers;
+review this workload impact before applying. Neither mode requests a host reboot.
+Keep the release pinned and argument overrides disabled. A scoped template may
+select a subset with `--nodes` without changing the approved cluster inventory.
 
 Run the adapter and script failure-path checks on a Linux controller:
 

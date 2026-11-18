@@ -22,6 +22,8 @@ def healthy():
                  'lrm NODE-2 (active, watchdog active, now)\nservice vm:100 (NODE-2, started)',
             'resources':[{'type':'qemu','node':'NODE-2','status':'running'}],
             'crm_active':'inactive','crm_unit':'masked-runtime',
+            'manager':{'node_request':{'NODE-1':{'maintenance':1}}},'crm_commands':'',
+            'watchdog_active':False,
         }
     return result
 
@@ -54,6 +56,18 @@ class GuardTests(unittest.TestCase):
         data['NODE-1']['boot_id']='f'*8+'-'+ 'b'*4+'-'+ 'c'*4+'-'+ 'd'*4+'-'+'e'*12
         with self.assertRaisesRegex(ValueError,'Unexpected reboot'):
             verify_cluster(list(data),data,baseline)
+
+    def test_clean_background_scrub_is_allowed_but_recovery_is_not(self):
+        for state in ['active+clean+scrubbing','active+clean+scrubbing+deep']:
+            data=healthy();data['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
+            verify_cluster(list(data),data)
+        for state in ['active+clean+remapped','active+clean+repair','active+clean+unknown']:
+            data=healthy();data['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
+            with self.assertRaises(ValueError):verify_cluster(list(data),data)
+
+    def test_local_watchdog_client_blocks_even_with_maintenance_label(self):
+        data=healthy();data['NODE-1']['watchdog_active']=True
+        with self.assertRaisesRegex(ValueError,'active clients'):verify_target('NODE-1',data)
 
     def test_active_or_restartable_crm_is_rejected(self):
         for changes in [{'crm_active':'active'},{'crm_unit':'enabled'}]:

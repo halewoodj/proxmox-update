@@ -28,6 +28,8 @@ Options:
   -j, --jobs N      Preview concurrency; apply requires 1 (default: 1)
   -p, --parallel    Preview all detected nodes at once
   -n, --dry-run     Check updates and reboot status without changing packages
+      --auto-maintenance
+                    Prepare/restore HA nodes automatically before installation
       --cluster-host HOST
                     Discover the cluster through a remote Proxmox node
       --nodes LIST  Only process comma-separated node names
@@ -42,6 +44,8 @@ REBOOT_NEEDED=()
 FAILED_NODES=()
 MAX_PARALLEL=1
 DRY_RUN=0
+AUTO_MAINTENANCE=0
+SKIPPED_NODES=()
 CLUSTER_HOST=""
 ONLY_NODES=()
 EXCLUDE_NODES=()
@@ -76,6 +80,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     -n|--dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --auto-maintenance)
+      AUTO_MAINTENANCE=1
       shift
       ;;
     --cluster-host)
@@ -184,6 +192,18 @@ cluster_gate() {
   python3 "$SCRIPT_DIR/semaphore/update_guard.py" --nodes "$(IFS=,; echo "${DETECTED_NODES[*]}")" --state "$TMP_DIR/boot-ids.json" "$@"
 }
 
+maintenance_step() {
+  local NODE="$1" ACTION="$2" RC
+  python3 "$SCRIPT_DIR/semaphore/maintenance.py" "$ACTION" \
+    --nodes "$(IFS=,; echo "${DETECTED_NODES[*]}")" --target "$NODE" \
+    --state "$TMP_DIR/$NODE.maintenance.json" --baseline "$TMP_DIR/boot-ids.json" &
+  ACTIVE_HELPER_PID=$!
+  wait "$ACTIVE_HELPER_PID"
+  RC=$?
+  ACTIVE_HELPER_PID=""
+  return "$RC"
+}
+
 remote_logged() {
   local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" LABEL="$4" RC
   remote_run "$NODE" "$TIMEOUT_SECONDS" "$COMMAND" >> "$TMP_DIR/$NODE.log" 2>&1
@@ -249,6 +269,8 @@ update_node() {
   local STATUS_FILE="$2"
   local SUMMARY_FILE="$3"
   local MODE_LABEL=""
+  local ACTIVE_HELPER_PID=""
+  trap '[ -z "$ACTIVE_HELPER_PID" ] || kill -TERM "$ACTIVE_HELPER_PID" 2>/dev/null; exit 130' INT TERM HUP
 
   if [ "$DRY_RUN" -eq 1 ]; then
     MODE_LABEL=" (dry run)"
@@ -337,7 +359,7 @@ update_node() {
     if [ "$DRY_RUN" -eq 1 ]; then
       node_status "${CYAN}Found ${BOLD}$COUNT${RESET}${CYAN} package change(s)${MODE_LABEL}${RESET}"
     else
-      node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
+      node_status "${CYAN}Planned ${BOLD}$COUNT${RESET}${CYAN} package change(s); checking safety...${RESET}"
     fi
   else
     node_status "${GREEN}No package changes needed${RESET}"
@@ -350,12 +372,22 @@ update_node() {
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "simulation includes package removals"
       return 1
     fi
+    if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
+      node_status "${CYAN}Preparing HA maintenance and evacuating guests...${RESET}"
+      if ! maintenance_step "$NODE" prepare; then
+        node_status "${RED}Maintenance preparation failed${RESET}"
+        write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        return 1
+      fi
+    fi
     # Recheck immediately before mutation, after metadata refresh and simulation.
-    if ! cluster_gate --target "$NODE" --apply; then
+    if ! cluster_gate --target "$NODE" --apply 2> "$TMP_DIR/$NODE.guard.log"; then
+      cat "$TMP_DIR/$NODE.guard.log" >&2
       node_status "${RED}Safety gate failed${RESET}"
-      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "node is not safe for package changes"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "$(tail -n 1 "$TMP_DIR/$NODE.guard.log")"
       return 1
     fi
+    node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
     remote_logged "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y --no-remove dist-upgrade" "dist-upgrade"
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
@@ -406,6 +438,23 @@ update_node() {
   if [ ${#REBOOT_REASONS[@]} -gt 0 ]; then
     printf -v REBOOT_REASON_TEXT "%s; " "${REBOOT_REASONS[@]}"
     REBOOT_REASON_TEXT=${REBOOT_REASON_TEXT%; }
+  fi
+
+  if [ "$AUTO_MAINTENANCE" -eq 1 ] && [ "$COUNT" -gt 0 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if ! maintenance_step "$NODE" plan; then
+        node_status "${RED}Automatic maintenance plan blocked${RESET}"
+        write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "FAILED" "automatic maintenance plan blocked"
+        return 1
+      fi
+    else
+      node_status "${CYAN}Restoring HA/CRM settings...${RESET}"
+      if ! maintenance_step "$NODE" restore; then
+        node_status "${RED}Maintenance restoration failed${RESET}"
+        write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "FAILED" "maintenance restoration failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        return 1
+      fi
+    fi
   fi
 
   local RESULT="OK"
@@ -552,7 +601,13 @@ chmod 700 "$TMP_DIR"
 printf 'Diagnostic logs and summaries: %s\n' "$TMP_DIR"
 # Keep logs on failure and success; they contain no SSH keys. Do not unlink while
 # package workers are still running if the controller receives a stop signal.
-trap 'echo "Controller interrupted; no further nodes will start. Check remote APT before retrying." >&2; exit 130' INT TERM HUP
+interrupt_controller() {
+  local PID
+  for PID in "${NODE_PIDS[@]}"; do kill -TERM "$PID" 2>/dev/null || true; done
+  echo "Controller interrupted; no further nodes will start. Inspect maintenance state and remote APT before retrying." >&2
+  exit 130
+}
+trap interrupt_controller INT TERM HUP
 
 if ! cluster_gate; then
   echo "Initial health check failed; no node jobs started." >&2
@@ -720,7 +775,9 @@ for NODE in "${NODES[@]}"; do
     REBOOT_NEEDED+=("$NODE")
   fi
 
-  if [ "$RESULT" != "OK" ]; then
+  if [ "$RESULT" = "SKIPPED" ]; then
+    SKIPPED_NODES+=("$NODE")
+  elif [ "$RESULT" != "OK" ]; then
     FAILED_NODES+=("$NODE")
   fi
 done
@@ -732,6 +789,7 @@ print_title "Update Summary"
 print_meta "Mode" "$RUN_MODE"
 print_meta "Nodes" "${#NODES[@]} processed"
 print_meta "Failures" "${#FAILED_NODES[@]}"
+print_meta "Skipped" "${#SKIPPED_NODES[@]}"
 print_meta "Reboots" "${#REBOOT_NEEDED[@]}"
 echo
 
@@ -774,6 +832,9 @@ for NODE in "${NODES[@]}"; do
   echo -e "${CYAN}${BOLD}$NODE${RESET}"
   if [ "$RESULT" = "OK" ]; then
     print_node_meta "Result" "${GREEN}OK${RESET}"
+  elif [ "$RESULT" = "SKIPPED" ]; then
+    print_node_meta "Result" "${YELLOW}SKIPPED${RESET}"
+    print_node_meta "Reason" "$ERROR_TEXT"
   else
     print_node_meta "Result" "${RED}FAILED${RESET}"
     print_node_meta "Errors" "$ERROR_TEXT"
