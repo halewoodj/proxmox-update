@@ -329,6 +329,20 @@ bash -n rolling-reboot.sh
 
 ## Semaphore
 
+An exceptional operator rollout is available through
+`semaphore/operator_apply.sh --acknowledge-storage-stalls --resume-node NODE-1
+--resume-state /path/to/NODE-1.maintenance.json --repair-package libpve-notify-perl`.
+Use a separate, explicitly authorized Semaphore template for this entry point;
+the normal preview/apply templates retain their strict election checks. This
+operator path resumes only a verified updater-owned, evacuated preparation,
+recovers the named interrupted package and finishes one node's APT operations
+before waiting for full Ceph health. It acknowledges election changes only after
+all four observers are healthy, boot identities are unchanged and package audits
+are clean. It then restores the owned HA/CRM settings and proceeds sequentially.
+Package removals and held-back upgrades are refused; kernels are installed
+without rebooting hosts. Run independent quorum, boot and HA monitoring throughout
+the operator job. This does not repair a storage latency problem.
+
 Use a **Bash** task template with `semaphore/run.sh` as the entry point. The
 controller needs Bash, Python 3 and OpenSSH. Store these in a Semaphore variable
 group:
