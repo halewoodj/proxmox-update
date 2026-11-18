@@ -5,11 +5,17 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from maintenance import Maintenance, check_plan
+from maintenance import Maintenance, MaintenancePending, check_plan
 from test_update_guard import healthy
 from update_guard import cluster_baseline
 
 GiB=1024**3
+
+
+class Clock:
+    def __init__(self):self.now=0
+    def __call__(self):return self.now
+    def sleep(self,seconds):self.now+=seconds
 
 
 class Cluster:
@@ -56,9 +62,10 @@ class MaintenanceTests(unittest.TestCase):
         self.cluster=Cluster()
         self.path=Path(self.tmp.name)/'node.json'
         self.baseline=cluster_baseline(self.cluster.data)
+        self.clock=Clock()
         self.helper=Maintenance(list(self.cluster.data),'NODE-1',self.path,self.baseline,
                                 collect=lambda:copy.deepcopy(self.cluster.data),execute=self.cluster.execute,
-                                sleep=lambda _:None,clock=lambda:0,timeout=1)
+                                sleep=self.clock.sleep,clock=self.clock,timeout=30)
 
     def test_complete_preparation_and_restore_in_safe_order(self):
         self.helper.prepare()
@@ -104,7 +111,6 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_failed_evacuation_never_stops_crm(self):
         self.cluster.evacuate=False
-        times=iter([0,2]);self.helper.clock=lambda:next(times)
         with self.assertRaisesRegex(ValueError,'Timed out'):self.helper.prepare()
         self.assertEqual(len(self.cluster.commands),1)
         self.assertTrue(json.loads(self.path.read_text())['maintenance_owned'])
@@ -124,7 +130,6 @@ class MaintenanceTests(unittest.TestCase):
                     execute(node,args)
                     if args[0]=='systemctl' and args[1]=='stop':self.cluster.data[node].update(changes)
                 self.helper.execute=stopped_with_unsafe_watchdog
-                times=iter([0,0,0,2]);self.helper.clock=lambda:next(times)
                 with self.assertRaisesRegex(ValueError,'Timed out'):self.helper.prepare()
                 self.assertFalse(any('mask' in args for args in self.cluster.commands))
 
@@ -156,6 +161,97 @@ class MaintenanceTests(unittest.TestCase):
         self.helper.prepare();self.helper.restore()
         # unmask never enables the service; it only removes the runtime mask.
         self.assertFalse(any('enable' in a and a[0]=='systemctl' for a in self.cluster.commands))
+
+    def test_normal_ha_states_are_pending_but_unsafe_states_fail(self):
+        for state in ['migrate','relocate','request_start','request_start_balance','request_stop',
+                      'error','fence','recovery','freeze','unexpected']:
+            with self.subTest(state=state):
+                data=copy.deepcopy(self.cluster.data)
+                for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, '+state)
+                if state in ['migrate','relocate','request_start','request_start_balance','request_stop']:
+                    with self.assertRaises(MaintenancePending):check_plan(list(data),'NODE-1',data)
+                else:
+                    with self.assertRaisesRegex(ValueError,'Unsafe HA service state'):
+                        check_plan(list(data),'NODE-1',data)
+
+    def test_prepare_waits_for_return_migration_before_any_changes(self):
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads<=3:
+                self.assertFalse(self.path.exists())
+                self.assertEqual(self.cluster.commands,[])
+                for d in data.values():
+                    d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')
+                data['NODE-2']['active_tasks']=[{'type':'qmigrate','id':'100'}]
+            return data
+        self.helper.collect=collect
+        self.helper.prepare()
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
+        self.assertGreaterEqual(self.clock.now,15)
+
+    def test_one_ready_observation_is_reset_by_a_new_transition(self):
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads==2:
+                for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, relocate')
+            return data
+        self.helper.collect=collect
+        self.helper.wait_ready()
+        self.assertEqual(reads,4)
+        self.assertEqual(self.cluster.commands,[])
+
+    def test_stuck_migration_times_out_without_state_or_commands(self):
+        for d in self.cluster.data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')
+        with self.assertRaisesRegex(ValueError,'Timed out waiting for HA readiness'):self.helper.prepare()
+        self.assertEqual(self.cluster.commands,[])
+        self.assertFalse(self.path.exists())
+
+    def test_safety_regression_while_waiting_still_aborts_immediately(self):
+        for scenario in ['ceph','epoch','quorum','reboot','service-error']:
+            with self.subTest(scenario=scenario):
+                self.setUp();reads=0
+                def collect():
+                    nonlocal reads
+                    reads+=1
+                    data=copy.deepcopy(self.cluster.data)
+                    for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')
+                    if reads==2:
+                        if scenario=='ceph':data['NODE-2']['ceph']['health']['status']='HEALTH_WARN'
+                        elif scenario=='epoch':
+                            for d in data.values():d['ceph']['election_epoch']+=2
+                        elif scenario=='quorum':data['NODE-2']['quorum']='Quorate: No'
+                        elif scenario=='reboot':data['NODE-2']['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
+                        else:data['NODE-2']['ha']=data['NODE-2']['ha'].replace('NODE-2, migrate','NODE-2, error')
+                    return data
+                self.helper.collect=collect
+                with self.assertRaises(ValueError):self.helper.prepare()
+                self.assertEqual(reads,2)
+                self.assertEqual(self.cluster.commands,[])
+                self.assertFalse(self.path.exists())
+
+    def test_restore_waits_for_delayed_failback_after_an_idle_observation(self):
+        self.helper.prepare()
+        reads=0
+        def collect():
+            nonlocal reads
+            data=copy.deepcopy(self.cluster.data)
+            if not data['NODE-1']['manager']:
+                reads+=1
+                if reads in [2,3]:
+                    for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')
+                    data['NODE-2']['active_tasks']=[{'type':'qmigrate','id':'100'}]
+            return data
+        self.helper.collect=collect
+        self.helper.restore()
+        self.assertGreaterEqual(reads,5)
+        self.assertGreaterEqual(self.clock.now,10)
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'restored')
 
 
 if __name__=='__main__':unittest.main()

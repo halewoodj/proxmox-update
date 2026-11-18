@@ -18,6 +18,10 @@ class MaintenanceInterrupted(Exception):
     pass
 
 
+class MaintenancePending(ValueError):
+    """Normal HA motion may finish; this is not permission to change the node."""
+
+
 def remote(node, args):
     command = shlex.join(['timeout', '--preserve-status', '90s', *args])
     result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
@@ -33,9 +37,22 @@ def running(data, node):
             and r.get('type') in ['qemu','lxc'] and r.get('status') != 'stopped']
 
 
+def service_transitions(data):
+    pending=[]
+    for line in data['ha'].splitlines():
+        if not line.startswith('service '):continue
+        match=re.fullmatch(r'service (\S+) \(([^,]+), ([^)]+)\)',line)
+        if not match:raise ValueError('Unrecognized HA service status on '+data['hostname']+': '+line)
+        state=match[3]
+        if state in ['started','stopped','disabled']:continue
+        if state not in ['migrate','relocate','request_start','request_start_balance','request_stop']:
+            raise ValueError('Unsafe HA service state on '+data['hostname']+': '+line)
+        pending.append(line)
+    return pending
+
+
 def stable(data):
-    return all(re.search(r', (?:started|stopped|disabled)\)$', line)
-               for line in data['ha'].splitlines() if line.startswith('service '))
+    return not service_transitions(data)
 
 
 def active_work(data):
@@ -46,6 +63,7 @@ def active_work(data):
 
 def check_plan(nodes, target, snapshots):
     data = snapshots[target]
+    pending=[]
     if data['manager'].get('disarm'):
         raise ValueError('HA stack is disarmed or changing its armed state')
     for observer in snapshots.values():
@@ -57,10 +75,13 @@ def check_plan(nodes, target, snapshots):
             if node != target and (maintenance_requested(observer, node)
                                     or lrm_maintenance(observer, node)):
                 raise ValueError(node+' already has HA maintenance; prepare only one node at a time')
-        if not stable(observer):
-            raise ValueError('HA services are still transitioning; wait before maintenance')
-        if active_work(observer):
+        pending.extend(service_transitions(observer))
+        tasks=active_work(observer)
+        if any(t.get('type') not in ['qmigrate','vzmigrate'] for t in tasks):
             raise ValueError('Active Proxmox tasks on '+observer['hostname']+'; wait before maintenance')
+        pending.extend('migration task '+str(t.get('id',''))+' on '+observer['hostname'] for t in tasks)
+    if pending:
+        raise MaintenancePending('HA is settling: '+'; '.join(sorted(set(pending))))
     if data['crm_active'] not in ['active','inactive']:
         raise ValueError(target+' CRM is changing state')
     if data['crm_unit'] not in ['enabled','disabled','static','masked','masked-runtime']:
@@ -99,6 +120,7 @@ class Maintenance:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(self.nodes),8)) as pool:
                 data = dict(pool.map(snapshot, self.nodes))
         verify_cluster(self.nodes, data, self.baseline)
+        for observer in data.values():service_transitions(observer)
         return data
 
     def record(self, state, phase):
@@ -108,22 +130,39 @@ class Maintenance:
         temporary.chmod(0o600)
         temporary.replace(self.path)
 
-    def wait(self, description, predicate):
+    def wait(self, description, predicate, *, consecutive=1):
         print('['+self.target+'] Waiting for '+description+'...', flush=True)
         deadline = self.clock()+self.timeout
+        ready_count=0
         while True:
             data = self.read()
             if predicate(data):
-                return data
+                ready_count+=1
+                if ready_count>=consecutive:return data
+            else:
+                ready_count=0
             if self.clock() >= deadline:
                 raise ValueError('Timed out waiting for '+description+' on '+self.target)
-            self.sleep(5)
+            if not ready_count:self.sleep(5)
+
+    def wait_ready(self):
+        last_pending=None
+        def ready(data):
+            nonlocal last_pending
+            try:
+                check_plan(self.nodes,self.target,data)
+                return True
+            except MaintenancePending as error:
+                if str(error)!=last_pending:
+                    print('['+self.target+'] '+str(error)+'; waiting before changing this node.',flush=True)
+                    last_pending=str(error)
+                return False
+        return self.wait('HA readiness before preparation',ready,consecutive=2)
 
     def prepare(self):
         if self.path.exists():
             raise ValueError('Maintenance state already exists; inspect '+str(self.path))
-        data = self.read()
-        check_plan(self.nodes, self.target, data)
+        data = self.wait_ready()
         original = data[self.target]
         state = {'node':self.target, 'baseline':self.baseline,
                  'original_crm_active':original['crm_active'],
@@ -159,7 +198,7 @@ class Maintenance:
         print('['+self.target+'] Maintenance prepared; recovery state: '+str(self.path), flush=True)
 
     def plan(self):
-        guests = check_plan(self.nodes,self.target,self.read())
+        guests = check_plan(self.nodes,self.target,self.wait_ready())
         print('['+self.target+'] Plan only: HA evacuates '+str(len(guests))+
               ' running guest(s), releases LRM watchdog, hands over/stops CRM, '
               'temporarily masks CRM; settings restored after successful package verification. '
@@ -187,7 +226,7 @@ class Maintenance:
             self.wait('HA maintenance exit and stable services',
                       lambda d:all(not maintenance_requested(v,self.target)
                                    and not lrm_maintenance(v,self.target) and stable(v)
-                                   and not active_work(v) for v in d.values()))
+                                   and not active_work(v) for v in d.values()),consecutive=2)
         self.read()
         self.record(state, 'restored')
         print('['+self.target+'] Original HA/CRM settings restored; cluster verified.', flush=True)

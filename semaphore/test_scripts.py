@@ -35,6 +35,14 @@ if command.startswith('python3 -c '):
  if os.environ.get('TEST_POST_REBOOT') and installed: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
  if os.environ.get('TEST_POST_CEPH') and installed:data['ceph']['health']['status']='HEALTH_WARN'
  if os.environ.get('TEST_POST_ELECTION') and any(os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+n) for n in ['NODE-1','NODE-2']):data['ceph']['election_epoch']+=2
+ if os.path.exists(os.environ['TEST_FIXTURE']+'.handoff'):
+  counter=os.environ['TEST_FIXTURE']+'.handoff.'+node
+  count=int(open(counter).read())+1 if os.path.exists(counter) else 1
+  open(counter,'w').write(str(count))
+  if count<=2:
+   state='error' if os.environ.get('TEST_HANDOFF_ERROR') and count==2 else 'migrate'
+   data['ha']=data['ha'].replace('NODE-2, started','NODE-2, '+state)
+   data['active_tasks']=[{'type':'qmigrate','id':'100'}]
  print(json.dumps(data))
 elif command.startswith('timeout --preserve-status 90s '):
  args=tokens[3:]
@@ -49,12 +57,20 @@ elif command.startswith('timeout --preserve-status 90s '):
    d['manager']={'node_request':{node:{'maintenance':1}}} if enable else {}
    old,new=('active, watchdog active','maintenance, watchdog standby') if enable else ('maintenance, watchdog standby','active, watchdog active')
    d['ha']=d['ha'].replace('lrm '+node+' ('+old,'lrm '+node+' ('+new)
- elif args[1]=='stop':fixture[node].update(crm_active='inactive',watchdog_active=False)
+ elif args[1]=='stop':
+  fixture[node].update(crm_active='inactive',watchdog_active=False)
+  peer=next(n for n in fixture if n!=node)
+  for d in fixture.values():
+   d['ha']=d['ha'].replace('master '+node+' ','master '+peer+' ')
+   for row in d['ha_status']:
+    if row['type']=='master' and row['node']==node:row['node']=peer
  elif args[1]=='mask':fixture[node]['crm_unit']='masked-runtime'
  elif args[1]=='unmask':fixture[node]['crm_unit']='enabled'
  elif args[1]=='start':fixture[node]['crm_active']='active'
  with open(os.environ['TEST_FIXTURE'],'w') as f:json.dump(fixture,f)
 elif command=='true' or command.startswith('command -v '):
+ if command=='true' and node=='NODE-2' and os.environ.get('TEST_HANDOFF'):
+  open(os.environ['TEST_FIXTURE']+'.handoff','w').close()
  if command=='true' and os.environ.get('TEST_LOST_WORKER'):
   os.kill(os.getppid(),signal.SIGKILL)
 elif 'pvecm nodes' in command: print('1 1 NODE-1 (local)\\n2 1 NODE-2')
@@ -101,6 +117,7 @@ class ScriptTests(unittest.TestCase):
             if extra.get('TEST_AUTO') or not extra.get('TEST_APPLY'):
                 for d in data.values():
                     d.update(manager={},active_tasks=[],ha_config=[{'sid':'vm:100'}],crm_commands='')
+                    d.update(crm_active='active',crm_unit='enabled',watchdog_active=True)
                     d['ha']=d['ha'].replace('maintenance, watchdog standby','active, watchdog active')
                     d['resources']=[{'type':'node','node':n,'maxmem':64*1024**3,'mem':8*1024**3} for n in data]
                 data['NODE-1'].update(crm_active='active',crm_unit='enabled',watchdog_active=True)
@@ -227,6 +244,21 @@ class ScriptTests(unittest.TestCase):
         keys=['systemctl mask','APT::Update::Error-Mode=any update','systemctl unmask','node-maintenance disable']
         indices=[next(i for i,c in enumerate(commands) if key in c) for key in keys]
         self.assertEqual(indices,sorted(indices))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_next_node_waits_for_late_failback_and_completes_both_nodes(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_HANDOFF='1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('[NODE-2] HA is settling:',result.stdout)
+        self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),2)
+        self.assertTrue(any(r['node']=='NODE-2' and '--no-remove dist-upgrade' in r['command'] for r in self.node_commands))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_next_node_stops_if_pending_failback_becomes_an_error(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_HANDOFF='1',TEST_HANDOFF_ERROR='1')
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertIn('Unsafe HA service state',result.stdout+result.stderr)
+        self.assertFalse(any(r['node']=='NODE-2' and ('apt-get' in r['command'] or 'node-maintenance enable' in r['command']) for r in self.node_commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_automatic_preparation_or_package_failure_never_restores_or_continues(self):

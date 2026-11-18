@@ -115,6 +115,15 @@ would preserve that hold and prevent NODE-2 from proceeding. A scoped
 and explicitly resolve an existing hold before a wider rollout; the updater does
 not clear it automatically.
 
+HA can start returning a guest after a node leaves maintenance. The next node
+waits for normal migration/relocation and start/stop transitions to finish, rather
+than treating that handoff as an update failure. Readiness and maintenance exit
+require two consecutive fresh observations. Waiting uses the existing bounded
+maintenance timeout; service errors, fencing/recovery/unknown states, quorum or
+Ceph regressions, changed election epochs and reboots still stop immediately.
+Logs name the service or migration task being awaited. No next-node maintenance
+request or APT command starts while the handoff is pending.
+
 1. Verify healthy peers, memory headroom, stable HA services and no conflicting
    Proxmox tasks or pending HA commands. Running guests outside HA require manual
    evacuation; the script does not guess their destination or storage options.
