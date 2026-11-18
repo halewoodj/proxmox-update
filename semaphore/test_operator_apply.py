@@ -4,7 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from operator_apply import plan_packages, resume_state, verify_recovery, rebase_owned
+from operator_apply import plan_packages, resume_state, verify_recovery, rebase_owned, recover_cached_archive
+from types import SimpleNamespace
 from maintenance import Maintenance
 from test_update_guard import healthy
 from update_guard import cluster_baseline
@@ -90,6 +91,28 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(plan_packages(output, complete=False),['libpve-notify-perl'])
         with self.assertRaises(ValueError):plan_packages(output)
         with self.assertRaises(ValueError):plan_packages('Remv pve-manager [9.2.30]',complete=False)
+
+    def test_cached_archive_replays_unpack_before_apt(self):
+        archive=Path(self.tmp.name)/'libpve-notify-perl_9.1.10_all.deb';archive.touch()
+        calls=[]
+        def query(args,**kw):
+            if args[0]=='dpkg-query':return '9.1.9'
+            return 'libpve-notify-perl' if args[-1]=='Package' else '9.1.10'
+        def execute(args,**kw):calls.append((args,kw));return SimpleNamespace(returncode=0)
+        recover_cached_archive('libpve-notify-perl',Path(self.tmp.name),query,execute)
+        self.assertEqual(calls[-1],(['dpkg','--unpack',str(archive)],{'check':True}))
+
+    def test_missing_wrong_or_older_cached_archive_never_unpacks(self):
+        for case in ['missing','wrong','older']:
+            with tempfile.TemporaryDirectory() as tmp:
+                if case!='missing':(Path(tmp)/'libpve-notify-perl_1_all.deb').touch()
+                calls=[]
+                def query(args,**kw):
+                    if args[0]=='dpkg-query':return '9.1.9'
+                    return 'wrong-package' if case=='wrong' else ('libpve-notify-perl' if args[-1]=='Package' else '1')
+                def execute(args,**kw):calls.append(args);return SimpleNamespace(returncode=1)
+                with self.assertRaises(ValueError):recover_cached_archive('libpve-notify-perl',Path(tmp),query,execute)
+                self.assertFalse(any('--unpack' in a for a in calls))
 
 
 if __name__=='__main__':unittest.main()

@@ -10,6 +10,7 @@ import concurrent.futures
 import copy
 import fcntl
 import json
+import inspect
 import os
 from pathlib import Path
 import re
@@ -90,6 +91,30 @@ def plan_packages(output, *, complete=True):
     if complete and re.search(r'\d+ not upgraded', output) and not re.search(r'\b0 not upgraded', output):
         raise ValueError('APT is keeping packages back; inspect the plan')
     return [line.split()[1] for line in output.splitlines() if line.startswith('Inst ')]
+
+
+def recover_cached_archive(package, root=Path('/var/cache/apt/archives'),
+                           query=subprocess.check_output, execute=subprocess.run):
+    """Use the already APT-downloaded archive to replay dpkg's interrupted unpack."""
+    installed = query(['dpkg-query','-W','-f=${Version}',package],text=True).strip()
+    selected = None
+    selected_version = installed
+    for archive in root.glob(package+'_*.deb'):
+        if query(['dpkg-deb','-f',str(archive),'Package'],text=True).strip() != package:
+            raise ValueError('Cached archive package identity differs')
+        version = query(['dpkg-deb','-f',str(archive),'Version'],text=True).strip()
+        if execute(['dpkg','--compare-versions',version,'ge',selected_version]).returncode == 0:
+            selected, selected_version = archive, version
+    if selected is None:
+        raise ValueError('No suitable already-downloaded recovery archive; refusing a downgrade')
+    print('Recovering interrupted unpack with '+str(selected)+' version '+selected_version,flush=True)
+    execute(['dpkg','--unpack',str(selected)],check=True)
+
+
+def archive_recovery_command(package):
+    code = 'import subprocess\nfrom pathlib import Path\n'+inspect.getsource(recover_cached_archive)
+    code += '\nrecover_cached_archive('+repr(package)+')\n'
+    return shlex.join(['nice','-n','19','ionice','-c','3','python3','-c',code])
 
 
 def package(node, directory, label, command, timeout=7200):
@@ -175,6 +200,7 @@ def worker(args):
         print('OPERATOR PROTECTED='+node, flush=True)
         package(node, directory, 'Refresh APT metadata', APT+'-o APT::Update::Error-Mode=any update', 1800)
         if node == args.resume_node:
+            package(node, directory, 'Recover interrupted dpkg unpack', archive_recovery_command(args.repair_package))
             fix = '--fix-broken --no-remove --reinstall install '+shlex.quote(args.repair_package)
             plan_packages(package(node, directory, 'Simulate package recovery', APT+'-s '+fix, 1800), complete=False)
             package(node, directory, 'Recover interrupted package', APT+'-y '+fix)
