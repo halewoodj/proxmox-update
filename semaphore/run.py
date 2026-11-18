@@ -174,7 +174,7 @@ def main():
             preflight(nodes, control, env)
             print(f'Mode: {args.mode}; selected nodes: {", ".join(selected)}', flush=True)
             if PROGRAM == 'update.sh' and args.mode == 'preview':
-                print('Preview refreshes APT metadata and simulates upgrades; no packages are changed.', flush=True)
+                print('Preview simulates upgrades using existing APT lists; metadata is not refreshed and may be stale.', flush=True)
                 print('Automatic HA maintenance is planned only; preview does not migrate guests or change services.', flush=True)
             elif PROGRAM == 'update.sh':
                 print('Apply prepares one HA node at a time, then restores it after verification. Container migration can restart containers.', flush=True)

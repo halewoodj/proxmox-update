@@ -99,26 +99,28 @@ boot-ID changes stop the queue even when cluster health has already recovered.
 
 ### Automatic HA preparation in Semaphore
 
-Semaphore preview plans HA preparation when packages are pending. It does not
+Semaphore preview uses existing APT lists, which may be stale, and plans HA preparation. It does not
 migrate guests, change services, install packages or reboot nodes. Semaphore apply
 uses `--auto-maintenance` to process one node at a time:
 
-1. Refresh metadata and simulate packages before moving any guests. Nodes without
-   package changes need no evacuation.
-2. Verify healthy peers, memory headroom, stable HA services and no conflicting
+1. Verify healthy peers, memory headroom, stable HA services and no conflicting
    Proxmox tasks or pending HA commands. Running guests outside HA require manual
    evacuation; the script does not guess their destination or storage options.
-3. Request HA node maintenance and wait for all running guests and migration
+2. Request HA node maintenance and wait for all running guests and migration
    workers to leave. HA respects its placement/storage rules;
    migration refusal or timeout stops the run. Container migrations can briefly
    restart containers.
-4. Gracefully stop the target CRM, wait for master handover when necessary and
+3. Gracefully stop the target CRM, wait for master handover when necessary and
    verify all local watchdog clients have closed using the running multiplexer's
    socket ownership and active-client marker. Some HA versions display
    `maintenance mode, watchdog active` even after the LRM closes its connection;
    that inferred label does not prove the actual connection state.
    Add a runtime CRM mask to keep
    package triggers from starting it during installation.
+4. Verify the prepared target before refreshing APT metadata. Disable persistent
+   APT binary caches so their rebuild uses memory. Refresh metadata, simulate
+   changes and refuse removals. Even a no-change refresh requires protection:
+   metadata/cache writes can stall the boot mirror before package installation.
 5. Recheck cluster health, boot IDs, package state and the prepared target, then
    install with `--no-remove`. Preserve APT output and verify the result.
 6. Remove only the mask introduced by this run, restore the CRM service's prior
@@ -302,7 +304,7 @@ project only to operators authorised to maintain those hypervisors. Restrict the
 key to the Semaphore controller's source IP and disable forwarding and PTY access.
 
 The updater runs from Semaphore with `--jobs 1 --auto-maintenance`. **Preview**
-refreshes APT metadata, simulates packages and prints the automatic maintenance
+simulates packages from existing APT lists, which may be stale, and prints the automatic maintenance
 plan; it does not move guests or change HA/services. **Apply** prepares and restores
 one node at a time as described above. Container migration can restart containers;
 review this workload impact before applying. Neither mode requests a host reboot.

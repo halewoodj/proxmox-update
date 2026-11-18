@@ -31,8 +31,9 @@ if command.startswith('python3 -c '):
  count=int(open(counter).read())+1 if os.path.exists(counter) else 1
  open(counter,'w').write(str(count))
  if os.environ.get('TEST_ARMED'): data['crm_active']='active'
- if os.environ.get('TEST_POST_REBOOT') and count>=3: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
- if os.environ.get('TEST_POST_CEPH') and count>=3:data['ceph']['health']['status']='HEALTH_WARN'
+ installed=os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+node)
+ if os.environ.get('TEST_POST_REBOOT') and installed: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
+ if os.environ.get('TEST_POST_CEPH') and installed:data['ceph']['health']['status']='HEALTH_WARN'
  print(json.dumps(data))
 elif command.startswith('timeout --preserve-status 90s '):
  args=tokens[3:]
@@ -64,12 +65,13 @@ elif 'qm list' in command:
 elif 'APT::Update::Error-Mode=any update' in command:
  if os.environ.get('TEST_APT_FAIL'):
   print('repository download diagnostic',file=sys.stderr);sys.exit(100)
-elif 'apt-get -s dist-upgrade' in command:
- print('Inst example [1] (2 repo [amd64])')
+elif '-s dist-upgrade' in command:
+ if not os.environ.get('TEST_NO_CHANGES'):print('Inst example [1] (2 repo [amd64])')
  if os.environ.get('TEST_REMOVAL'):print('Remv proxmox-ve [9.2]')
 elif '--no-remove dist-upgrade' in command:
  if os.environ.get('TEST_UPGRADE_FAIL'):
   print('dpkg exact failure diagnostic',file=sys.stderr);sys.exit(100)
+ open(os.environ['TEST_FIXTURE']+'.installed.'+node,'w').close()
 elif command=='pveversion':
  if os.environ.get('TEST_BAD_VERSION'):sys.exit(255)
  print('pve-manager/test')
@@ -136,7 +138,7 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless((ROOT/'update.sh').exists() and BASH_MAJOR>=4,'requires updater and Bash 4+')
     def test_failed_apt_update_returns_failure(self):
-        result,commands=self.run_script('update.sh',TEST_APT_FAIL='1')
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_APT_FAIL='1')
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertIn('apt-get update failed',result.stdout)
         self.assertFalse(any('dist-upgrade' in c for c in commands))
@@ -156,6 +158,7 @@ class ScriptTests(unittest.TestCase):
         result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_ARMED='1')
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
+        self.assertFalse(any('APT::Update::Error-Mode=any update' in c for c in commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_reboot_or_ceph_warning_after_success_stops_remaining_nodes(self):
@@ -185,17 +188,28 @@ class ScriptTests(unittest.TestCase):
         result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_SELECTED='NODE-1')
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         indices={key:next(i for i,c in enumerate(commands) if key in c) for key in [
-            'node-maintenance enable','systemctl stop','systemctl mask','--no-remove dist-upgrade',
+            'node-maintenance enable','systemctl stop','systemctl mask','APT::Update::Error-Mode=any update','--no-remove dist-upgrade',
             'pveversion','systemctl unmask','systemctl start','node-maintenance disable']}
         self.assertEqual(list(indices.values()),sorted(indices.values()))
+        self.assertTrue(all('Dir::Cache::pkgcache=' in c and 'Dir::Cache::srcpkgcache=' in c
+                            for c in commands if 'apt-get' in c))
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_no_package_changes_still_protects_refresh_and_restores(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_SELECTED='NODE-1',TEST_NO_CHANGES='1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
+        keys=['systemctl mask','APT::Update::Error-Mode=any update','systemctl unmask','node-maintenance disable']
+        indices=[next(i for i,c in enumerate(commands) if key in c) for key in keys]
+        self.assertEqual(indices,sorted(indices))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_automatic_preparation_or_package_failure_never_restores_or_continues(self):
-        for scenario in ['TEST_PREP_FAIL','TEST_UPGRADE_FAIL']:
+        for scenario in ['TEST_PREP_FAIL','TEST_APT_FAIL','TEST_UPGRADE_FAIL']:
             with self.subTest(scenario=scenario):
                 result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
-                if scenario=='TEST_PREP_FAIL':self.assertFalse(any('--no-remove dist-upgrade' in c for c in commands))
+                if scenario=='TEST_PREP_FAIL':self.assertFalse(any('apt-get' in c for c in commands))
                 self.assertFalse(any('node-maintenance disable' in c or 'systemctl unmask' in c for c in commands))
                 self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
 
@@ -205,6 +219,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('Plan only',result.stdout)
         self.assertFalse(any('node-maintenance' in c or 'systemctl mask' in c or '--no-remove dist-upgrade' in c for c in commands))
+        self.assertFalse(any('APT::Update::Error-Mode=any update' in c for c in commands))
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_cancelling_preparation_never_starts_install_or_next_node(self):
@@ -225,7 +240,8 @@ class ScriptTests(unittest.TestCase):
     def test_updater_preview_does_not_apply_package_changes(self):
         result,commands=self.run_script('update.sh')
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-        self.assertEqual(sum('apt-get -s dist-upgrade' in c for c in commands),2)
+        self.assertEqual(sum('-s dist-upgrade' in c for c in commands),2)
+        self.assertFalse(any('APT::Update::Error-Mode=any update' in c for c in commands))
         self.assertFalse(any('-y dist-upgrade' in c or 'autoremove' in c or 'apt-get clean' in c for c in commands))
 
     @unittest.skipUnless(not (ROOT/'update.sh').exists(),'standalone reboot repository')

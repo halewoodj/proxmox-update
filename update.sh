@@ -54,6 +54,7 @@ APT_UPDATE_TIMEOUT=1800
 APT_UPGRADE_TIMEOUT=7200
 APT_MAINT_TIMEOUT=1800
 APT_ENV="DEBIAN_FRONTEND=noninteractive"
+APT_CACHE_OPTS="-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache="
 APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 SSH_OPTS=(
   -o BatchMode=yes
@@ -317,20 +318,38 @@ update_node() {
 
   local UPDATE_ERRORS=()
 
-  # ---- STEP 1: apt-get update ----
-  node_status "${CYAN}Running apt-get update...${RESET}"
-  remote_logged "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get -o APT::Update::Error-Mode=any update" "apt-get update"
-  if [ $? -ne 0 ]; then
-    node_status "${RED}apt-get update failed${RESET}"
-    write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
-    return 1
-  else
+  # Metadata refresh can rebuild large caches and stall the boot mirror too.
+  # Protect the node before any APT writes, even if no packages are pending.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
+      node_status "${CYAN}Preparing HA maintenance before APT writes...${RESET}"
+      if ! maintenance_step "$NODE" prepare; then
+        node_status "${RED}Maintenance preparation failed${RESET}"
+        write_summary 0 "" "" "" 0 "FAILED" "maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        return 1
+      fi
+    fi
+    if ! cluster_gate --target "$NODE" --apply 2> "$TMP_DIR/$NODE.guard.log"; then
+      cat "$TMP_DIR/$NODE.guard.log" >&2
+      node_status "${RED}Safety gate failed before APT refresh${RESET}"
+      write_summary 0 "" "" "" 0 "FAILED" "$(tail -n 1 "$TMP_DIR/$NODE.guard.log")"
+      return 1
+    fi
+    node_status "${CYAN}Running apt-get update...${RESET}"
+    remote_logged "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -o APT::Update::Error-Mode=any update" "apt-get update"
+    if [ $? -ne 0 ]; then
+      node_status "${RED}apt-get update failed${RESET}"
+      write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
+      return 1
+    fi
     node_status "${GREEN}apt-get update complete${RESET}"
+  else
+    node_status "${CYAN}Preview uses existing APT lists; metadata is not refreshed.${RESET}"
   fi
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get -s dist-upgrade" 2> "$TMP_DIR/$NODE.simulation.log")
+  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -s dist-upgrade" 2> "$TMP_DIR/$NODE.simulation.log")
   if [ $? -ne 0 ]; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
@@ -372,14 +391,6 @@ update_node() {
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "simulation includes package removals"
       return 1
     fi
-    if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
-      node_status "${CYAN}Preparing HA maintenance and evacuating guests...${RESET}"
-      if ! maintenance_step "$NODE" prepare; then
-        node_status "${RED}Maintenance preparation failed${RESET}"
-        write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
-        return 1
-      fi
-    fi
     # Recheck immediately before mutation, after metadata refresh and simulation.
     if ! cluster_gate --target "$NODE" --apply 2> "$TMP_DIR/$NODE.guard.log"; then
       cat "$TMP_DIR/$NODE.guard.log" >&2
@@ -388,7 +399,7 @@ update_node() {
       return 1
     fi
     node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
-    remote_logged "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y --no-remove dist-upgrade" "dist-upgrade"
+    remote_logged "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS $APT_DPKG_OPTS -y --no-remove dist-upgrade" "dist-upgrade"
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "dist-upgrade failed"
@@ -401,7 +412,7 @@ update_node() {
   # Keep package caches and old kernels for diagnosis/recovery. Cleanup is separate.
 
   local GUARD_ARGS=(--target "$NODE")
-  if [ "$DRY_RUN" -eq 0 ] && [ "$COUNT" -gt 0 ]; then GUARD_ARGS+=(--apply); fi
+  if [ "$DRY_RUN" -eq 0 ]; then GUARD_ARGS+=(--apply); fi
   if ! cluster_gate "${GUARD_ARGS[@]}"; then
     node_status "${RED}Post-update health check failed${RESET}"
     write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "post-update cluster/package health check failed"
@@ -440,7 +451,7 @@ update_node() {
     REBOOT_REASON_TEXT=${REBOOT_REASON_TEXT%; }
   fi
 
-  if [ "$AUTO_MAINTENANCE" -eq 1 ] && [ "$COUNT" -gt 0 ]; then
+  if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
       if ! maintenance_step "$NODE" plan; then
         node_status "${RED}Automatic maintenance plan blocked${RESET}"

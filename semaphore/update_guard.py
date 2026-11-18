@@ -85,7 +85,8 @@ def verify_cluster(expected, snapshots, baseline=None):
             raise ValueError('No quorum on ' + node)
         ceph = data['ceph']
         if ceph['health']['status'] != 'HEALTH_OK' or ceph['health'].get('mutes'):
-            raise ValueError('Ceph unhealthy or health checks muted on ' + node)
+            raise ValueError('Ceph unhealthy or health checks muted on ' + node + ': '
+                             + json.dumps(ceph['health'],sort_keys=True))
         osds = ceph['osdmap']
         if not (osds['num_osds'] == osds['num_up_osds'] == osds['num_in_osds']):
             raise ValueError('Ceph has missing OSDs on ' + node)
