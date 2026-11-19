@@ -36,6 +36,9 @@ if command.startswith('python3 -c '):
  counter=os.environ['TEST_FIXTURE']+'.'+node
  count=int(open(counter).read())+1 if os.path.exists(counter) else 1
  open(counter,'w').write(str(count))
+ if os.environ.get('TEST_DPKG_COLLISION') and node=='NODE-1' and count==5:
+  print('fcntl.lockf(f,fcntl.LOCK_SH|fcntl.LOCK_NB)\\nBlockingIOError: [Errno 11] Resource temporarily unavailable',file=sys.stderr)
+  sys.exit(1)
  if os.environ.get('TEST_ARMED'): data['crm_active']='active'
  installed=os.path.exists(os.environ['TEST_FIXTURE']+'.installed.'+node)
  if os.environ.get('TEST_POST_REBOOT') and installed: data['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -168,7 +171,7 @@ class ScriptTests(unittest.TestCase):
                 finally:
                     if process.poll() is None:process.kill();process.communicate()
             else:
-                result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=30)
+                result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=120)
             commands=[json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             self.node_commands=[json.loads(line) for line in nodes.read_text().splitlines()] if nodes.exists() else []
             # The script deliberately retains evidence. Test fixtures can be removed.
@@ -208,13 +211,33 @@ class ScriptTests(unittest.TestCase):
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_reboot_or_ceph_warning_after_success_stops_remaining_nodes(self):
-        for scenario in ['TEST_POST_REBOOT','TEST_POST_CEPH','TEST_POST_ELECTION']:
+        for scenario in ['TEST_POST_REBOOT','TEST_POST_CEPH']:
             with self.subTest(scenario=scenario):
                 result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',**{scenario:'1'})
                 self.assertEqual(result.returncode,1,result.stdout+result.stderr)
                 self.assertFalse(any(x['node']=='NODE-2' and 'apt-get' in x['command'] for x in self.node_commands))
-                if scenario=='TEST_POST_ELECTION':
-                    self.assertIn('election changed',result.stdout+result.stderr)
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_recovered_election_continues_only_after_healthy_boundary_checks(self):
+        result,commands=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_POST_ELECTION='1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('Ceph fully healthy and stable',result.stdout)
+        self.assertEqual(sum('--no-remove dist-upgrade' in c for c in commands),2)
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_failed_preparation_reports_unknown_reboot_status(self):
+        result,_=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_PREP_FAIL='1')
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('none required',result.stdout)
+        self.assertIn('not determined on 2 node(s)',result.stdout)
+        self.assertIn('2 selected; 1 attempted',result.stdout)
+
+    @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
+    def test_transient_dpkg_lock_during_preparation_completes_normally(self):
+        result,_=self.run_script('update.sh',TEST_APPLY='1',TEST_AUTO='1',TEST_DPKG_COLLISION='1',TEST_SELECTED='NODE-1')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('Waiting for existing dpkg activity',result.stdout)
+        self.assertEqual([s['phase'] for s in self.maintenance_states],['restored'])
 
     @unittest.skipUnless(BASH_MAJOR>=4,'requires Bash 4+')
     def test_removal_and_parallel_apply_are_rejected(self):

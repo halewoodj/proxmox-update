@@ -89,6 +89,13 @@ def preflight(nodes, control, env):
         if read_remote(node, 'hostname -s', env) != node:
             raise ValueError('SSH hostname does not match inventory: ' + node)
         print('SSH verified: ' + node, flush=True)
+    if PROGRAM=='update.sh':
+        # Also works when a test/embedding loader invokes this file via runpy.
+        sys.path.insert(0,str(Path(__file__).resolve().parent))
+        from update_guard import read_verified, collect_snapshots
+        read_verified(list(nodes),collect=lambda:collect_snapshots(list(nodes),env=env))
+        print('Approved cluster membership, quorum and Ceph HEALTH_OK verified.',flush=True)
+        return
     members = read_remote(control, 'pvecm nodes', env)
     detected = [line.split()[2] for line in members.splitlines()
                 if len(line.split()) >= 3 and line.split()[0].isdigit()]

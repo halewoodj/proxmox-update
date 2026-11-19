@@ -103,9 +103,20 @@ Semaphore preview uses existing APT lists, which may be stale, and plans HA prep
 migrate guests, change services, install packages or reboot nodes. Semaphore apply
 uses `--auto-maintenance` to process one node at a time:
 
-Each boundary also compares Ceph's monitor election epoch with the run's initial
-baseline. A monitor election stops the run even if `HEALTH_OK` has recovered
-between checks; another node cannot start after that event.
+Each boundary verifies unchanged boot IDs and consistent Ceph monitor evidence.
+A recovered monitor election is recorded and requires two fresh, healthy
+observations at the same epoch. A higher election epoch alone does not fail the
+rollout. Snapshots crossing an election are read again until observers agree;
+persistent disagreement times out. Epoch regression and unexpected reboots still
+stop it.
+
+The shared checks used by normal preview and apply wait up to ten minutes for
+existing dpkg activity, without deleting locks or interrupting another package
+process. A transient read timeout is retried up to three times. APT installation
+also waits for its frontend lock. Known `MON_DOWN`/`SLOW_OPS` warnings with monitor
+quorum wait up to five minutes for full recovery and two stable observations;
+no next-node action starts while waiting. Missing OSDs, unsafe PGs, lost Corosync
+quorum, muted checks, package damage and stale HA heartbeats remain hard failures.
 
 The initial check also validates the entire selected rollout against existing HA
 maintenance. If NODE-1 is already held, selecting NODE-1 and NODE-2 is blocked
@@ -120,7 +131,7 @@ waits for normal migration/relocation and start/stop transitions to finish, rath
 than treating that handoff as an update failure. Readiness and maintenance exit
 require two consecutive fresh observations. Waiting uses the existing bounded
 maintenance timeout; service errors, fencing/recovery/unknown states, quorum or
-Ceph regressions, changed election epochs and reboots still stop immediately.
+unsafe Ceph states and reboots still stop immediately.
 Logs name the service or migration task being awaited. No next-node maintenance
 request or APT command starts while the handoff is pending.
 
@@ -333,7 +344,7 @@ An exceptional operator rollout is available through
 `semaphore/operator_apply.sh --acknowledge-storage-stalls --resume-node NODE-1
 --resume-state /path/to/NODE-1.maintenance.json --repair-package libpve-notify-perl`.
 Use a separate, explicitly authorized Semaphore template for this entry point;
-the normal preview/apply templates retain their strict election checks. This
+the normal preview/apply templates retain their full health and reboot checks. This
 operator path resumes only a verified updater-owned, evacuated preparation,
 recovers the named interrupted package and finishes one node's APT operations
 before waiting for full Ceph health. It acknowledges election changes only after

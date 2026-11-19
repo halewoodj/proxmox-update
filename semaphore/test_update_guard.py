@@ -4,7 +4,7 @@ from pathlib import Path
 import pathlib
 import tempfile
 import unittest
-from update_guard import WATCHDOG_PROBE, cluster_baseline, verify_cluster, verify_target, verify_selection
+from update_guard import WATCHDOG_PROBE, cluster_baseline, verify_cluster, verify_target, verify_selection, snapshot, read_verified, ClusterPending, collect_snapshots
 
 
 def healthy():
@@ -125,11 +125,105 @@ class GuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Unexpected reboot'):
             verify_cluster(list(data),data,baseline)
 
-    def test_monitor_election_is_rejected_after_health_recovers(self):
+    def test_recovered_election_is_allowed_but_requires_two_stable_reads(self):
         data=healthy();baseline=cluster_baseline(data)
         for d in data.values():d['ceph']['election_epoch']+=2
-        with self.assertRaisesRegex(ValueError,'election changed'):
-            verify_cluster(list(data),data,baseline)
+        self.assertTrue(verify_cluster(list(data),data,baseline))
+        reads=[];sleeps=[]
+        def collect():reads.append(True);return copy.deepcopy(data)
+        read_verified(list(data),baseline,collect=collect,sleep=sleeps.append)
+        self.assertEqual(len(reads),2);self.assertEqual(sleeps,[5])
+        reads.clear()
+        read_verified(list(data),baseline,collect=collect,confirmed_epoch=102,sleep=sleeps.append)
+        self.assertEqual(len(reads),1)
+
+    def test_changing_election_must_settle_and_regression_is_rejected(self):
+        data=healthy();baseline=cluster_baseline(data);reads=[];sleeps=[]
+        def collect():
+            value=copy.deepcopy(data);epoch=[102,104,104][len(reads)];reads.append(epoch)
+            for d in value.values():d['ceph']['election_epoch']=epoch
+            return value
+        read_verified(list(data),baseline,collect=collect,sleep=sleeps.append)
+        self.assertEqual(reads,[102,104,104])
+        for d in data.values():d['ceph']['election_epoch']=98
+        with self.assertRaisesRegex(ValueError,'regressed'):verify_cluster(list(data),data,baseline)
+
+    def test_snapshots_crossing_an_election_are_read_again(self):
+        base=healthy();baseline=cluster_baseline(base);reads=[]
+        def collect():
+            value=copy.deepcopy(base);reads.append(True)
+            for row in value.values():row['ceph']['election_epoch']=102
+            if len(reads)==1:value['NODE-1']['ceph']['election_epoch']=100
+            return value
+        read_verified(list(base),baseline,collect=collect,sleep=lambda _:None)
+        self.assertEqual(len(reads),3)
+        bad=collect();bad['NODE-1']['ceph']['election_epoch']=104;bad['NODE-2']['quorum']='Quorate: No'
+        with self.assertRaisesRegex(ValueError,'No quorum'):verify_cluster(list(base),bad,baseline)
+
+    def test_transient_package_lock_waits_without_disabling_real_checks(self):
+        calls=[];now=[0]
+        def read(node):
+            calls.append(node)
+            if len(calls)<3:raise ValueError('fcntl.lockf: BlockingIOError: Resource temporarily unavailable')
+            return node,healthy()[node]
+        def sleep(seconds):now[0]+=seconds
+        node,data=snapshot('NODE-1',read=read,sleep=sleep,clock=lambda:now[0])
+        self.assertEqual(node,'NODE-1');self.assertEqual(len(calls),3);self.assertEqual(now[0],10)
+        verify_cluster(['NODE-1','NODE-2'],healthy())
+
+    def test_long_lock_wait_discards_other_nodes_earlier_snapshots(self):
+        now=[0];calls={'NODE-1':0,'NODE-2':0}
+        def read(node):
+            calls[node]+=1
+            if node=='NODE-2' and calls[node]==1:now[0]+=60
+            data=healthy()[node];data['sample_generation']=calls[node]
+            return node,data
+        data=collect_snapshots(list(calls),read=read,clock=lambda:now[0])
+        self.assertTrue(all(row['sample_generation']==2 for row in data.values()))
+        def slow(node):now[0]+=40;return node,healthy()[node]
+        with self.assertRaisesRegex(ValueError,'fresh cluster observations'):
+            collect_snapshots(list(calls),read=slow,clock=lambda:now[0],timeout=60)
+
+    def test_persistent_lock_and_read_timeouts_are_bounded(self):
+        now=[0]
+        def sleep(seconds):now[0]+=seconds
+        def locked(node):raise ValueError('fcntl.lockf: BlockingIOError: Resource temporarily unavailable')
+        with self.assertRaisesRegex(ValueError,'Timed out waiting'):
+            snapshot('NODE-1',read=locked,sleep=sleep,clock=lambda:now[0],lock_timeout=6)
+        calls=[]
+        def timed_out(node):calls.append(node);raise ValueError('ceph status timed out')
+        with self.assertRaises(ValueError):snapshot('NODE-1',read=timed_out,sleep=lambda _:None)
+        self.assertEqual(len(calls),3)
+        def bad_identity(node):raise ValueError('unexpected identity')
+        with self.assertRaisesRegex(ValueError,'identity'):
+            snapshot('NODE-1',read=bad_identity,sleep=lambda _:self.fail('Must not retry'))
+
+    def test_known_ceph_warning_waits_for_recovery_but_not_for_unsafe_osds(self):
+        data=healthy();baseline=cluster_baseline(data);reads=[]
+        def collect():
+            value=copy.deepcopy(data);reads.append(True)
+            if len(reads)==1:
+                for d in value.values():
+                    d['ceph'].update(monmap={'num_mons':2},quorum_names=['NODE-1','NODE-2'])
+                    d['ceph']['health'].update(status='HEALTH_WARN',checks={'SLOW_OPS':{}})
+            return value
+        read_verified(list(data),baseline,collect=collect,sleep=lambda _:None)
+        self.assertEqual(len(reads),3)
+        for d in data.values():
+            d['ceph'].update(monmap={'num_mons':2},quorum_names=['NODE-1','NODE-2'])
+            d['ceph']['health'].update(status='HEALTH_WARN',checks={'SLOW_OPS':{}})
+        with self.assertRaises(ClusterPending):verify_cluster(list(data),data,baseline)
+        data['NODE-1']['ceph']['osdmap']['num_up_osds']=3
+        with self.assertRaisesRegex(ValueError,'missing OSD'):verify_cluster(list(data),data,baseline)
+
+    def test_persistent_ceph_warning_times_out_without_permission_to_proceed(self):
+        data=healthy();now=[0]
+        for d in data.values():
+            d['ceph'].update(monmap={'num_mons':2},quorum_names=['NODE-1','NODE-2'])
+            d['ceph']['health'].update(status='HEALTH_WARN',checks={'SLOW_OPS':{}})
+        def sleep(seconds):now[0]+=seconds
+        with self.assertRaisesRegex(ValueError,'Timed out waiting'):
+            read_verified(list(data),collect=lambda:copy.deepcopy(data),timeout=6,sleep=sleep,clock=lambda:now[0])
 
     def test_disagreeing_or_invalid_election_evidence_is_rejected(self):
         for value in [101,0,'100']:

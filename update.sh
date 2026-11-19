@@ -55,7 +55,7 @@ APT_UPGRADE_TIMEOUT=7200
 APT_MAINT_TIMEOUT=1800
 APT_ENV="DEBIAN_FRONTEND=noninteractive"
 APT_CACHE_OPTS="-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache="
-APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600"
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -764,6 +764,7 @@ echo -e "${GREEN}${BOLD}All node jobs have finished.${RESET}"
 echo
 
 # ---- COLLECT SUMMARY DATA FROM FILES ----
+REBOOT_UNKNOWN=()
 for NODE in "${NODES[@]}"; do
   SUMMARY_FILE="$TMP_DIR/$NODE.summary"
   COUNT=0
@@ -805,6 +806,8 @@ for NODE in "${NODES[@]}"; do
 
   if [ "$REBOOT" = "1" ]; then
     REBOOT_NEEDED+=("$NODE")
+  elif [[ -z "$RK" || -z "$LK" ]]; then
+    REBOOT_UNKNOWN+=("$NODE")
   fi
 
   if [ "$RESULT" = "SKIPPED" ]; then
@@ -819,14 +822,18 @@ clear_screen
 RULE_WIDTH=$(terminal_width)
 print_title "Update Summary"
 print_meta "Mode" "$RUN_MODE"
-print_meta "Nodes" "${#NODES[@]} processed"
+print_meta "Nodes" "${#NODES[@]} selected; $(( ${#NODES[@]} - ${#SKIPPED_NODES[@]} )) attempted"
 print_meta "Failures" "${#FAILED_NODES[@]}"
 print_meta "Skipped" "${#SKIPPED_NODES[@]}"
-print_meta "Reboots" "${#REBOOT_NEEDED[@]}"
+print_meta "Reboots" "${#REBOOT_NEEDED[@]} required; ${#REBOOT_UNKNOWN[@]} unknown"
 echo
 
 if [ ${#REBOOT_NEEDED[@]} -eq 0 ]; then
-  print_meta "Reboots" "${GREEN}none required${RESET}"
+  if [ ${#REBOOT_UNKNOWN[@]} -gt 0 ]; then
+    print_meta "Reboots" "${YELLOW}not determined on ${#REBOOT_UNKNOWN[@]} node(s)${RESET}"
+  else
+    print_meta "Reboots" "${GREEN}none required${RESET}"
+  fi
 else
   print_meta "Reboots" "${YELLOW}required${RESET}"
   for NODE in "${REBOOT_NEEDED[@]}"; do
@@ -893,7 +900,9 @@ for NODE in "${NODES[@]}"; do
     print_node_meta "Kernel" "${RED}Could not be determined${RESET}"
   fi
 
-  if [[ -n "$REBOOT_REASON_TEXT" ]]; then
+  if [[ -z "$RK" || -z "$LK" ]]; then
+    print_node_meta "Reboot" "${YELLOW}Could not be determined${RESET}"
+  elif [[ -n "$REBOOT_REASON_TEXT" ]]; then
     print_node_meta "Reboot" "${YELLOW}$REBOOT_REASON_TEXT${RESET}"
   else
     print_node_meta "Reboot" "None detected"
@@ -902,7 +911,7 @@ done
 
 echo
 print_rule
-echo -e "${BOLD}All nodes processed.${RESET}"
+echo -e "${BOLD}Update run finished.${RESET}"
 print_rule
 
 # Automation must receive a failure when any node's package maintenance failed.

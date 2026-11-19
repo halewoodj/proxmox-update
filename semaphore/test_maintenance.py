@@ -265,7 +265,7 @@ class MaintenanceTests(unittest.TestCase):
                     check_plan(list(data),'NODE-1',data)
 
     def test_safety_regression_while_waiting_still_aborts_immediately(self):
-        for scenario in ['ceph','epoch','quorum','reboot','service-error']:
+        for scenario in ['ceph','quorum','reboot','service-error']:
             with self.subTest(scenario=scenario):
                 self.setUp();reads=0
                 def collect():
@@ -275,8 +275,6 @@ class MaintenanceTests(unittest.TestCase):
                     for d in data.values():d['ha']=d['ha'].replace('NODE-2, started','NODE-2, migrate')
                     if reads==2:
                         if scenario=='ceph':data['NODE-2']['ceph']['health']['status']='HEALTH_WARN'
-                        elif scenario=='epoch':
-                            for d in data.values():d['ceph']['election_epoch']+=2
                         elif scenario=='quorum':data['NODE-2']['quorum']='Quorate: No'
                         elif scenario=='reboot':data['NODE-2']['boot_id']='ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee'
                         else:data['NODE-2']['ha']=data['NODE-2']['ha'].replace('NODE-2, migrate','NODE-2, error')

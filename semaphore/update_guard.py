@@ -8,6 +8,11 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+
+
+class ClusterPending(ValueError):
+    """Read-only waiting is allowed; this is never permission to mutate a node."""
 
 
 WATCHDOG_PROBE = r'''
@@ -99,8 +104,10 @@ def verify_cluster(expected, snapshots, baseline=None):
     if set(snapshots) != set(expected):
         raise ValueError('Missing node health evidence')
     epochs={d['ceph']['election_epoch'] for d in snapshots.values()}
-    if len(epochs)!=1 or any(type(epoch) is not int or epoch<1 for epoch in epochs):
-        raise ValueError('Ceph monitor election evidence is missing or observers disagree')
+    if any(type(epoch) is not int or epoch<1 for epoch in epochs):
+        raise ValueError('Ceph monitor election evidence is missing or invalid')
+    pending=[]
+    advanced=[]
     for node, data in snapshots.items():
         if data['hostname'] != node:
             raise ValueError('Unexpected SSH hostname for ' + node)
@@ -119,12 +126,24 @@ def verify_cluster(expected, snapshots, baseline=None):
         if not re.search(r'^\s*Quorate:\s*Yes\s*$', data['quorum'], re.MULTILINE):
             raise ValueError('No quorum on ' + node)
         ceph = data['ceph']
-        if ceph['health']['status'] != 'HEALTH_OK' or ceph['health'].get('mutes'):
-            raise ValueError('Ceph unhealthy or health checks muted on ' + node + ': '
-                             + json.dumps(ceph['health'],sort_keys=True))
-        if baseline is not None and original['ceph_election_epoch'] != ceph['election_epoch']:
-            raise ValueError('Ceph monitor election changed during this run on '+node+
-                             '; stop even though health has recovered and inspect before another node')
+        health=ceph['health']
+        if health.get('mutes'):
+            raise ValueError('Ceph health checks muted on '+node)
+        if health['status'] != 'HEALTH_OK':
+            checks=set(health.get('checks',{}))
+            mons=ceph.get('monmap',{}).get('num_mons',0)
+            quorum=ceph.get('quorum_names',[])
+            if (health['status']=='HEALTH_WARN' and checks
+                    and checks <= {'MON_DOWN','SLOW_OPS'} and type(mons) is int and mons>0
+                    and len(set(quorum))==len(quorum) and len(quorum)>=mons//2+1):
+                pending.append(node+': '+', '.join(sorted(checks)))
+            else:
+                raise ValueError('Ceph unhealthy on '+node+': '+json.dumps(health,sort_keys=True))
+        if baseline is not None:
+            epoch=original['ceph_election_epoch']
+            if type(epoch) is not int or epoch<1 or ceph['election_epoch']<epoch:
+                raise ValueError('Ceph election epoch regressed or baseline invalid on '+node)
+            if epoch != ceph['election_epoch']:advanced.append(node)
         osds = ceph['osdmap']
         if not (osds['num_osds'] == osds['num_up_osds'] == osds['num_in_osds']):
             raise ValueError('Ceph has missing OSDs on ' + node)
@@ -142,6 +161,11 @@ def verify_cluster(expected, snapshots, baseline=None):
         for row in daemons:
             if not -5 <= data['now']-row['timestamp'] <= 30:
                 raise ValueError('Stale HA heartbeat on ' + row['node'])
+    if len(epochs)!=1:
+        pending.append('observers disagree on Ceph monitor election evidence')
+    if pending:
+        raise ClusterPending('Waiting for Ceph to recover fully: '+'; '.join(pending))
+    return bool(advanced)
 
 
 def verify_target(node, snapshots):
@@ -178,14 +202,86 @@ def verify_target(node, snapshots):
                 raise ValueError('HA service is not stable: ' + line)
 
 
-def snapshot(node):
+def snapshot_once(node, *, env=None):
     command = shlex.join(['python3', '-c', SNAPSHOT])
     result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                              '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4',
-                             'root@'+node, command], capture_output=True, text=True, timeout=240)
+                             'root@'+node, command], capture_output=True, text=True, timeout=240,env=env)
     if result.returncode:
         raise ValueError('Cannot verify ' + node + ': ' + result.stderr.strip())
     return node, json.loads(result.stdout)
+
+
+def snapshot(node, *, read=None, env=None, sleep=time.sleep, clock=time.monotonic,
+             lock_timeout=600, read_attempts=3):
+    deadline=clock()+lock_timeout
+    failures=0
+    waiting=False
+    while True:
+        try:return (read or (lambda n:snapshot_once(n,env=env)))(node)
+        except (ValueError,subprocess.TimeoutExpired) as error:
+            detail=str(error)
+            locked=all(t in detail for t in ['fcntl.lockf','BlockingIOError','Resource temporarily unavailable'])
+            if locked:
+                if clock()>=deadline:
+                    raise ValueError('Timed out waiting for existing dpkg activity on '+node) from error
+                if not waiting:
+                    print('['+node+'] Waiting for existing dpkg activity to release package locks...',flush=True)
+                    waiting=True
+            else:
+                transient=isinstance(error,subprocess.TimeoutExpired) or any(
+                    t in detail for t in ['subprocess.TimeoutExpired','timed out','Connection reset by peer','Connection closed by'])
+                failures+=1
+                if not transient or failures>=read_attempts:raise
+                print('['+node+'] Transient read failure; retry '+str(failures)+'/'+str(read_attempts-1)+': '+detail.splitlines()[-1],flush=True)
+            sleep(5)
+
+
+def collect_snapshots(nodes, *, env=None, read=None, clock=time.monotonic,
+                      max_age=30, timeout=600):
+    deadline=clock()+timeout
+    def timed_read(node):
+        started=clock()
+        name,data=(read or (lambda n:snapshot(n,env=env)))(node)
+        return name,data,started
+    while True:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(nodes),8)) as pool:
+            rows=list(pool.map(timed_read,nodes))
+        now=clock()
+        if all(now-started<=max_age for _,_,started in rows):
+            return {name:data for name,data,_ in rows}
+        if now>=deadline:
+            raise ValueError('Timed out collecting fresh cluster observations after package/read waits')
+        print('Refreshing every node after a long package/read wait; earlier observations discarded.',flush=True)
+
+
+def read_verified(nodes, baseline=None, *, collect=None, confirmed_epoch=None,
+                  timeout=300, sleep=time.sleep, clock=time.monotonic):
+    deadline=clock()+timeout
+    recovering=False
+    healthy_epoch=None
+    healthy_count=0
+    last=None
+    while True:
+        data=(collect or (lambda:collect_snapshots(nodes)))()
+        try:
+            advanced=verify_cluster(nodes,data,baseline)
+        except ClusterPending as error:
+            recovering=True;healthy_count=0
+            if str(error)!=last:print(str(error),flush=True);last=str(error)
+        else:
+            epoch=next(iter(data.values()))['ceph']['election_epoch']
+            settling=advanced and epoch!=confirmed_epoch
+            if epoch!=healthy_epoch:healthy_count=0
+            healthy_epoch=epoch;healthy_count+=1
+            if not (recovering or settling) or healthy_count>=2:
+                if recovering or settling:
+                    print('Ceph fully healthy and stable at election epoch '+str(epoch)+
+                          '; unchanged boot IDs and all cluster checks verified.',flush=True)
+                return data
+        if clock()>=deadline:
+            raise ValueError('Timed out waiting for full, stable cluster health; no further node actions allowed')
+        sleep(5)
 
 
 def main():
@@ -203,11 +299,9 @@ def main():
         raise ValueError('Target outside approved inventory')
     if args.apply and not args.target:
         raise ValueError('Apply checks require a target node')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(nodes), 8)) as pool:
-        snapshots = dict(pool.map(snapshot, nodes))
     path = Path(args.state)
     baseline = json.loads(path.read_text()) if path.exists() else None
-    verify_cluster(nodes, snapshots, baseline)
+    snapshots=read_verified(nodes,baseline)
     if args.selected is not None:
         verify_selection(nodes,args.selected.split(','),snapshots)
     if args.apply:
@@ -215,7 +309,7 @@ def main():
     if baseline is None:
         path.write_text(json.dumps(cluster_baseline(snapshots))+'\n')
         path.chmod(0o600)
-    print('Cluster health, package state, unchanged boot IDs and Ceph election epoch verified.', flush=True)
+    print('Cluster health, package state, unchanged boot IDs and consistent Ceph quorum verified.', flush=True)
 
 
 if __name__ == '__main__':

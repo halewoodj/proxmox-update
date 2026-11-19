@@ -24,7 +24,7 @@ import time
 import run
 from maintenance import Maintenance, MaintenanceInterrupted, service_transitions
 from update_guard import (snapshot, cluster_baseline, verify_cluster,
-                          verify_selection, verify_target)
+                          verify_selection, verify_target, collect_snapshots)
 
 ROOT = Path(__file__).resolve().parents[1]
 APT = ('DEBIAN_FRONTEND=noninteractive nice -n 19 ionice -c 3 apt-get '
@@ -62,8 +62,7 @@ def wait_snapshot(node, *, read=snapshot, sleep=time.sleep, clock=time.monotonic
 
 
 def collect(nodes):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        return dict(pool.map(wait_snapshot, nodes))
+    return collect_snapshots(nodes)
 
 
 def verify_recovery(nodes, data, boots, repair=None):

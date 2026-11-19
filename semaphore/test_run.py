@@ -9,17 +9,25 @@ import sys
 import tempfile
 import time
 import unittest
+from test_update_guard import healthy
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / 'semaphore/run.py'
 
 FAKE_SSH = '''#!/usr/bin/env python3
-import os,sys
+import os,sys,json
 args=sys.argv[1:]
 dest=next(a for a in args if a.startswith('root@'))
 command=args[-1]
 node=dest.split('@')[1]
 if command=='hostname -s': print(node)
+elif command.startswith('python3 -c '):
+ data=json.loads(os.environ['TEST_CLUSTER_JSON'])[node]
+ if os.environ.get('TEST_EXTRA_MEMBER'):data['members']+='\\n3 1 NODE-3'
+ if os.environ.get('TEST_QUORUM'):data['quorum']='Quorate: '+os.environ['TEST_QUORUM']
+ if os.environ.get('TEST_HEALTH'):
+  data['ceph']['health'].update(status=os.environ['TEST_HEALTH'].split()[0],checks={'TEST_WARNING':{}})
+ print(json.dumps(data))
 elif command=='pvecm nodes':
  print('1 1 NODE-1 (local)\\n2 1 NODE-2')
  if os.environ.get('TEST_EXTRA_MEMBER'): print('3 1 NODE-3')
@@ -72,6 +80,7 @@ class RunnerTests(unittest.TestCase):
                        PVE_NODES_JSON=json.dumps({'NODE-1':'192.0.2.1','NODE-2':'192.0.2.2'}),
                        PVE_CLUSTER_HOST='NODE-1', PVE_KNOWN_HOSTS='NODE-1 ssh-ed25519 fake',
                        PVE_SSH_PRIVATE_KEY='SECRET-MARKER', TEST_INVOCATION=str(invocation),
+                       TEST_CLUSTER_JSON=json.dumps(healthy()),
                        TEST_LOCK_PATH=str(tmp/'maintenance.lock'), **extra)
             command=[sys.executable, '-c', DRIVER, str(RUNNER), *args]
             if extra.get('TEST_WAIT'):

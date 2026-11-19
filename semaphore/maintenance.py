@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from update_guard import snapshot, verify_cluster, verify_target, maintenance_requested, lrm_maintenance
+from update_guard import snapshot, verify_cluster, verify_target, maintenance_requested, lrm_maintenance, read_verified, collect_snapshots
 
 
 class MaintenanceInterrupted(Exception):
@@ -125,15 +125,18 @@ class Maintenance:
         self.path, self.baseline = Path(path), baseline
         self.collect, self.execute = collect, execute
         self.sleep, self.clock, self.timeout = sleep, clock, timeout
+        self.confirmed_epoch=None
 
     def read(self):
-        if self.collect:
-            data = self.collect()
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(self.nodes),8)) as pool:
-                data = dict(pool.map(snapshot, self.nodes))
-        verify_cluster(self.nodes, data, self.baseline)
-        for observer in data.values():service_transitions(observer)
+        def collect():
+            if self.collect:data=self.collect()
+            else:data=collect_snapshots(self.nodes)
+            for observer in data.values():service_transitions(observer)
+            return data
+        data=read_verified(self.nodes,self.baseline,collect=collect,
+                           confirmed_epoch=self.confirmed_epoch,timeout=min(self.timeout,300),
+                           sleep=self.sleep,clock=self.clock)
+        self.confirmed_epoch=next(iter(data.values()))['ceph']['election_epoch']
         return data
 
     def record(self, state, phase):
