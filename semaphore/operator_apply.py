@@ -43,9 +43,27 @@ def stop(signum, frame):
         raise MaintenanceInterrupted('Operator rollout interrupted; preserve maintenance state')
 
 
+def wait_snapshot(node, *, read=snapshot, sleep=time.sleep, clock=time.monotonic, timeout=600):
+    deadline = clock()+timeout
+    waiting = False
+    while True:
+        try:
+            return read(node)
+        except ValueError as error:
+            detail = str(error)
+            if not all(text in detail for text in ['fcntl.lockf','BlockingIOError','Resource temporarily unavailable']):
+                raise
+            if clock() >= deadline:
+                raise ValueError('Timed out waiting for existing package activity on '+node) from error
+            if not waiting:
+                print('['+node+'] Waiting for existing package activity to release dpkg locks; no package process is interrupted.',flush=True)
+                waiting = True
+            sleep(5)
+
+
 def collect(nodes):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        return dict(pool.map(snapshot, nodes))
+        return dict(pool.map(wait_snapshot, nodes))
 
 
 def verify_recovery(nodes, data, boots, repair=None):
@@ -205,12 +223,13 @@ def worker(args):
     for node in selected:
         print('OPERATOR TARGET='+node, flush=True)
         if node == args.resume_node:
-            helper = Maintenance(list(nodes), node, state_path, baseline)
+            helper = Maintenance(list(nodes), node, state_path, baseline, collect=lambda:collect(nodes))
             rebase_owned(helper, data, baseline)
         else:
             data, baseline = recovered(nodes, boots, directory, node+'-before')
             verify_selection(list(nodes), [node], data)
-            helper = Maintenance(list(nodes), node, directory/(node+'.maintenance.json'), baseline)
+            helper = Maintenance(list(nodes), node, directory/(node+'.maintenance.json'), baseline,
+                                 collect=lambda:collect(nodes))
             helper.prepare()
         verify_target(node, helper.read() if node != args.resume_node else data)
         print('OPERATOR PROTECTED='+node, flush=True)

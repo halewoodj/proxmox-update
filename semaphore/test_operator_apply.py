@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from operator_apply import plan_packages, resume_state, verify_recovery, rebase_owned, recover_cached_archive
+from operator_apply import plan_packages, resume_state, verify_recovery, rebase_owned, recover_cached_archive, wait_snapshot
 from types import SimpleNamespace
 from maintenance import Maintenance
 from test_update_guard import healthy
@@ -131,6 +131,26 @@ class OperatorTests(unittest.TestCase):
         verify_recovery(self.nodes,self.data,self.boots,repair)
         self.data['NODE-1']['audit']+='\n\nPackages requiring reinstallation:\n dbus damaged'
         with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,repair)
+
+    def test_external_dpkg_lock_waits_then_reads_fresh_state(self):
+        now=[0];calls=[]
+        def read(node):
+            calls.append(node)
+            if len(calls)<3:raise ValueError('fcntl.lockf: BlockingIOError: Resource temporarily unavailable')
+            return node,{'fresh':True}
+        def sleep(seconds):now[0]+=seconds
+        self.assertEqual(wait_snapshot('NODE-1',read=read,sleep=sleep,clock=lambda:now[0]),('NODE-1',{'fresh':True}))
+        self.assertEqual(now[0],10)
+
+    def test_persistent_lock_has_a_bound_and_other_errors_do_not_retry(self):
+        now=[0]
+        def locked(node):raise ValueError('fcntl.lockf: BlockingIOError: Resource temporarily unavailable')
+        def sleep(seconds):now[0]+=seconds
+        with self.assertRaisesRegex(ValueError,'Timed out'):
+            wait_snapshot('NODE-1',read=locked,sleep=sleep,clock=lambda:now[0],timeout=6)
+        def broken(node):raise ValueError('quorum lost')
+        with self.assertRaisesRegex(ValueError,'quorum lost'):
+            wait_snapshot('NODE-1',read=broken,sleep=lambda _:self.fail('Must not retry'))
         self.data['NODE-1']['audit']='Reinstall these packages:\n libpve-notify-perl Notify module.\n pve-manager Manager.'
         with self.assertRaises(ValueError):verify_recovery(self.nodes,self.data,self.boots,('NODE-1','libpve-notify-perl'))
 
