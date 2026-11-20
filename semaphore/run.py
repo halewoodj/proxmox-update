@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 PROGRAM = 'update.sh'
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +89,13 @@ def preflight(nodes, control, env):
         if read_remote(node, 'hostname -s', env) != node:
             raise ValueError('SSH hostname does not match inventory: ' + node)
         print('SSH verified: ' + node, flush=True)
+    if PROGRAM=='update.sh':
+        # Also works when a test/embedding loader invokes this file via runpy.
+        sys.path.insert(0,str(Path(__file__).resolve().parent))
+        from update_guard import read_verified, collect_snapshots
+        read_verified(list(nodes),collect=lambda:collect_snapshots(list(nodes),env=env))
+        print('Approved cluster membership, quorum and Ceph HEALTH_OK verified.',flush=True)
+        return
     members = read_remote(control, 'pvecm nodes', env)
     detected = [line.split()[2] for line in members.splitlines()
                 if len(line.split()) >= 3 and line.split()[0].isdigit()]
@@ -105,12 +114,48 @@ def script_args(mode, control, selected):
     args = ['bash', str(ROOT / PROGRAM), '--cluster-host', 'root@' + control,
             '--nodes', ','.join(selected)]
     if PROGRAM == 'update.sh':
-        args.extend(['--jobs', '1'])
+        args.extend(['--jobs', '1', '--auto-maintenance'])
     else:
         args.extend(['--direct-node-ssh', '--yes'])
     if mode == 'preview':
         args.append('--dry-run')
     return args
+
+
+def run_script(argv,env,lock_fd):
+    process=None
+    interrupted=[]
+    def stop(signum,frame):
+        if not interrupted:interrupted.append(time.monotonic())
+        if process is not None:
+            try:os.killpg(process.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+    previous={sig:signal.signal(sig,stop) for sig in [signal.SIGINT,signal.SIGTERM,signal.SIGHUP]}
+    try:
+        # Semaphore signals the runner PID. A separate group lets the runner
+        # forward that cancellation to Bash workers, helpers and SSH children.
+        # Keep the maintenance lock in the worker too: killing only the runner
+        # must not permit a second job while the original worker is still alive.
+        guarded=[sys.executable,str(ROOT/'semaphore/parent_guard.py'),str(os.getpid()),*argv]
+        process=subprocess.Popen(guarded,env=env,start_new_session=True,pass_fds=(lock_fd,))
+        if interrupted:stop(signal.SIGTERM,None)
+        while True:
+            try:
+                result=process.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                # Package I/O may be uninterruptible. Keep the lock and SSH
+                # material while helpers verify the owned remote unit; killing
+                # them after an arbitrary grace period would erase that proof.
+                continue
+        if interrupted:
+            try:os.killpg(process.pid,signal.SIGTERM)
+            except ProcessLookupError:pass
+            print('Runner cancelled; no further nodes will start. Inspect retained state and remote APT before retrying.',file=sys.stderr)
+            return 130
+        return result
+    finally:
+        for sig,handler in previous.items():signal.signal(sig,handler)
 
 
 def main():
@@ -138,8 +183,11 @@ def main():
             preflight(nodes, control, env)
             print(f'Mode: {args.mode}; selected nodes: {", ".join(selected)}', flush=True)
             if PROGRAM == 'update.sh' and args.mode == 'preview':
-                print('Preview refreshes APT metadata and simulates upgrades; no packages are changed.', flush=True)
-            return subprocess.call(script_args(args.mode, control, selected), env=env)
+                print('Preview simulates upgrades using existing APT lists; metadata is not refreshed and may be stale.', flush=True)
+                print('Automatic HA maintenance is planned only; preview does not migrate guests or change services.', flush=True)
+            elif PROGRAM == 'update.sh':
+                print('Apply prepares one HA node at a time, then restores it after verification. Container migration can restart containers.', flush=True)
+            return run_script(script_args(args.mode, control, selected),env,lock.fileno())
 
 
 if __name__ == '__main__':

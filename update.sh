@@ -25,9 +25,11 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  -j, --jobs N      Number of nodes to update at once (default: 1)
-  -p, --parallel    Update all detected nodes at once
+  -j, --jobs N      Preview concurrency; apply requires 1 (default: 1)
+  -p, --parallel    Preview all detected nodes at once
   -n, --dry-run     Check updates and reboot status without changing packages
+      --auto-maintenance
+                    Prepare/restore HA nodes automatically before installation
       --cluster-host HOST
                     Discover the cluster through a remote Proxmox node
       --nodes LIST  Only process comma-separated node names
@@ -42,6 +44,8 @@ REBOOT_NEEDED=()
 FAILED_NODES=()
 MAX_PARALLEL=1
 DRY_RUN=0
+AUTO_MAINTENANCE=0
+SKIPPED_NODES=()
 CLUSTER_HOST=""
 ONLY_NODES=()
 EXCLUDE_NODES=()
@@ -50,7 +54,8 @@ APT_UPDATE_TIMEOUT=1800
 APT_UPGRADE_TIMEOUT=7200
 APT_MAINT_TIMEOUT=1800
 APT_ENV="DEBIAN_FRONTEND=noninteractive"
-APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+APT_CACHE_OPTS="-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache="
+APT_DPKG_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600"
 SSH_OPTS=(
   -o BatchMode=yes
   -o ConnectTimeout=10
@@ -76,6 +81,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     -n|--dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --auto-maintenance)
+      AUTO_MAINTENANCE=1
       shift
       ;;
     --cluster-host)
@@ -114,6 +123,11 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$MAX_PARALLEL" -ne 1 ]; then
+  echo "Error: applying cluster updates requires --jobs 1." >&2
+  exit 1
+fi
 
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo -e "${RED}Error: this script requires Bash 4 or newer.${RESET}"
@@ -172,6 +186,47 @@ remote_run() {
   ssh "${SSH_OPTS[@]}" root@"$NODE" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
 }
 
+# Check the whole detected cluster between nodes, including previously updated nodes.
+# The helper is read-only and refuses an armed HA node; it does not disable fencing.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cluster_gate() {
+  python3 "$SCRIPT_DIR/semaphore/update_guard.py" --nodes "$(IFS=,; echo "${DETECTED_NODES[*]}")" --state "$TMP_DIR/boot-ids.json" "$@"
+}
+
+maintenance_step() {
+  local NODE="$1" ACTION="$2" RC
+  python3 "$SCRIPT_DIR/semaphore/maintenance.py" "$ACTION" \
+    --nodes "$(IFS=,; echo "${DETECTED_NODES[*]}")" --target "$NODE" \
+    --state "$TMP_DIR/$NODE.maintenance.json" --baseline "$TMP_DIR/boot-ids.json" &
+  ACTIVE_HELPER_PID=$!
+  wait "$ACTIVE_HELPER_PID"
+  RC=$?
+  ACTIVE_HELPER_PID=""
+  return "$RC"
+}
+
+remote_logged() {
+  local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" LABEL="$4" RC
+  remote_package "$NODE" "$TIMEOUT_SECONDS" "$COMMAND" >> "$TMP_DIR/$NODE.log" 2>&1
+  RC=$?
+  if [ "$RC" -ne 0 ]; then
+    printf '[%s] %s failed (exit %s). Last output:\n' "$NODE" "$LABEL" "$RC" >&2
+    tail -n 60 "$TMP_DIR/$NODE.log" >&2
+  fi
+  return "$RC"
+}
+
+remote_package() {
+  local NODE="$1" TIMEOUT_SECONDS="$2" COMMAND="$3" RC
+  python3 "$SCRIPT_DIR/semaphore/remote_apt.py" --node "$NODE" \
+    --timeout "$TIMEOUT_SECONDS" --directory "$TMP_DIR" -- "$COMMAND" &
+  ACTIVE_HELPER_PID=$!
+  wait "$ACTIVE_HELPER_PID"
+  RC=$?
+  ACTIVE_HELPER_PID=""
+  return "$RC"
+}
+
 print_rule() {
   local WIDTH="${RULE_WIDTH:-80}"
   local LINE
@@ -226,6 +281,8 @@ update_node() {
   local STATUS_FILE="$2"
   local SUMMARY_FILE="$3"
   local MODE_LABEL=""
+  local ACTIVE_HELPER_PID=""
+  trap 'if [ -n "$ACTIVE_HELPER_PID" ]; then kill -TERM "$ACTIVE_HELPER_PID" 2>/dev/null || true; wait "$ACTIVE_HELPER_PID" 2>/dev/null || true; fi; exit 130' INT TERM HUP
 
   if [ "$DRY_RUN" -eq 1 ]; then
     MODE_LABEL=" (dry run)"
@@ -267,30 +324,56 @@ update_node() {
   if [ $? -ne 0 ]; then
     node_status "${RED}SSH connection failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "SSH connection failed"
-    return
+    return 1
   fi
 
   local UPDATE_ERRORS=()
 
-  # ---- STEP 1: apt-get update ----
-  node_status "${CYAN}Running apt-get update...${RESET}"
-  remote_run "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get update" &>/dev/null
-  if [ $? -ne 0 ]; then
-    node_status "${RED}apt-get update failed${RESET}"
-    write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
-    return
-  else
+  # Metadata refresh can rebuild large caches and stall the boot mirror too.
+  # Protect the node before any APT writes, even if no packages are pending.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
+      node_status "${CYAN}Preparing HA maintenance before APT writes...${RESET}"
+      if ! maintenance_step "$NODE" prepare; then
+        node_status "${RED}Maintenance preparation failed${RESET}"
+        local PREPARATION_DETAIL="maintenance preparation failed; no changes made; see $TMP_DIR/$NODE.log"
+        if [ -f "$TMP_DIR/$NODE.maintenance.json" ]; then
+          PREPARATION_DETAIL="maintenance preparation failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        fi
+        write_summary 0 "" "" "" 0 "FAILED" "$PREPARATION_DETAIL"
+        return 1
+      fi
+    fi
+    if ! cluster_gate --target "$NODE" --apply 2> "$TMP_DIR/$NODE.guard.log"; then
+      cat "$TMP_DIR/$NODE.guard.log" >&2
+      node_status "${RED}Safety gate failed before APT refresh${RESET}"
+      write_summary 0 "" "" "" 0 "FAILED" "$(tail -n 1 "$TMP_DIR/$NODE.guard.log")"
+      return 1
+    fi
+    node_status "${CYAN}Running apt-get update...${RESET}"
+    remote_logged "$NODE" "$APT_UPDATE_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -o APT::Update::Error-Mode=any update" "apt-get update"
+    if [ $? -ne 0 ]; then
+      node_status "${RED}apt-get update failed${RESET}"
+      write_summary 0 "" "" "" 0 "FAILED" "apt-get update failed"
+      return 1
+    fi
     node_status "${GREEN}apt-get update complete${RESET}"
+  else
+    node_status "${CYAN}Preview uses existing APT lists; metadata is not refreshed.${RESET}"
   fi
 
   # ---- Determine packages that will be upgraded (simulation) ----
   node_status "${CYAN}Calculating upgrades...${RESET}"
-  UPGRADE_SIM=$(remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get -s dist-upgrade" 2>/dev/null)
-  if [ $? -ne 0 ]; then
+  # Keep the helper PID in this worker, including during preview. A command
+  # substitution would hide its PID from the worker's cancellation trap.
+  if ! remote_package "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS -s dist-upgrade" \
+      > "$TMP_DIR/$NODE.simulation.out" 2> "$TMP_DIR/$NODE.simulation.log"; then
     node_status "${RED}Upgrade simulation failed${RESET}"
     write_summary 0 "" "" "" 0 "FAILED" "upgrade simulation failed"
-    return
+    cat "$TMP_DIR/$NODE.simulation.log" >&2
+    return 1
   fi
+  UPGRADE_SIM=$(cat "$TMP_DIR/$NODE.simulation.out")
 
   INST_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Inst / {printf "%s ", $2}' | sed 's/ *$//')
   REMV_PKGS=$(printf '%s\n' "$UPGRADE_SIM" | awk '/^Remv / {printf "%s ", $2}' | sed 's/ *$//')
@@ -313,7 +396,7 @@ update_node() {
     if [ "$DRY_RUN" -eq 1 ]; then
       node_status "${CYAN}Found ${BOLD}$COUNT${RESET}${CYAN} package change(s)${MODE_LABEL}${RESET}"
     else
-      node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
+      node_status "${CYAN}Planned ${BOLD}$COUNT${RESET}${CYAN} package change(s); checking safety...${RESET}"
     fi
   else
     node_status "${GREEN}No package changes needed${RESET}"
@@ -321,47 +404,52 @@ update_node() {
 
   # ---- STEP 2: dist-upgrade ----
   if [ "$COUNT" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    remote_run "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y dist-upgrade" &>/dev/null
+    if [ -n "$REMV_PKGS" ]; then
+      node_status "${RED}Package removals require review${RESET}"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "simulation includes package removals"
+      return 1
+    fi
+    # Recheck immediately before mutation, after metadata refresh and simulation.
+    if ! cluster_gate --target "$NODE" --apply 2> "$TMP_DIR/$NODE.guard.log"; then
+      cat "$TMP_DIR/$NODE.guard.log" >&2
+      node_status "${RED}Safety gate failed${RESET}"
+      write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "$(tail -n 1 "$TMP_DIR/$NODE.guard.log")"
+      return 1
+    fi
+    node_status "${CYAN}Applying ${BOLD}$COUNT${RESET}${CYAN} package change(s)...${RESET}"
+    remote_logged "$NODE" "$APT_UPGRADE_TIMEOUT" "$APT_ENV apt-get $APT_CACHE_OPTS $APT_DPKG_OPTS -y --no-remove dist-upgrade" "dist-upgrade"
     if [ $? -ne 0 ]; then
       node_status "${RED}Upgrade failed${RESET}"
       write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "dist-upgrade failed"
-      return
+      return 1
     fi
 
     node_status "${GREEN}Upgrade complete${RESET}"
   fi
 
-  # ---- STEP 3: autoremove ----
-  if [ "$DRY_RUN" -eq 0 ]; then
-    node_status "${CYAN}Removing unused packages...${RESET}"
-    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get $APT_DPKG_OPTS -y autoremove" &>/dev/null
-    if [ $? -ne 0 ]; then
-      node_status "${RED}autoremove failed${RESET}"
-      UPDATE_ERRORS+=("autoremove failed")
-    else
-      node_status "${GREEN}autoremove complete${RESET}"
-    fi
-  fi
+  # Keep package caches and old kernels for diagnosis/recovery. Cleanup is separate.
 
-  # ---- STEP 4: clean ----
-  if [ "$DRY_RUN" -eq 0 ]; then
-    node_status "${CYAN}Cleaning package cache...${RESET}"
-    remote_run "$NODE" "$APT_MAINT_TIMEOUT" "$APT_ENV apt-get clean" &>/dev/null
-    if [ $? -ne 0 ]; then
-      node_status "${RED}apt-get clean failed${RESET}"
-      UPDATE_ERRORS+=("apt-get clean failed")
-    else
-      node_status "${GREEN}apt-get clean complete${RESET}"
-    fi
+  local GUARD_ARGS=(--target "$NODE")
+  if [ "$DRY_RUN" -eq 0 ]; then GUARD_ARGS+=(--apply); fi
+  if ! cluster_gate "${GUARD_ARGS[@]}"; then
+    node_status "${RED}Post-update health check failed${RESET}"
+    write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "post-update cluster/package health check failed"
+    return 1
   fi
 
   # ---- CHECK KERNEL VERSIONS / REBOOT ----
   node_status "${CYAN}Checking kernel & reboot requirement...${RESET}"
 
-  PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'pveversion' 2>/dev/null)
-  RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r' 2>/dev/null)
-  LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
-    "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1" 2>/dev/null)
+  # pveversion consults APT and can rebuild its disk cache. Query dpkg directly
+  # so a preview/version check cannot recreate that large boot-disk write burst.
+  if ! PVEVERSION=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" "dpkg-query -W -f='\${binary:Package}/\${Version}' pve-manager") || [ -z "$PVEVERSION" ] ||
+     ! RKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" 'uname -r') || [ -z "$RKERNEL" ] ||
+     ! LKERNEL=$(remote_run "$NODE" "$REMOTE_CHECK_TIMEOUT" \
+       "set -o pipefail; ls -1 /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -n1") || [ -z "$LKERNEL" ]; then
+    node_status "${RED}Version/kernel verification failed${RESET}"
+    write_summary "$COUNT" "$PKGS" "" "" 0 "FAILED" "version/kernel verification failed"
+    return 1
+  fi
 
   local NEED_REBOOT=0
   local REBOOT_REASONS=()
@@ -381,6 +469,23 @@ update_node() {
   if [ ${#REBOOT_REASONS[@]} -gt 0 ]; then
     printf -v REBOOT_REASON_TEXT "%s; " "${REBOOT_REASONS[@]}"
     REBOOT_REASON_TEXT=${REBOOT_REASON_TEXT%; }
+  fi
+
+  if [ "$AUTO_MAINTENANCE" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if ! maintenance_step "$NODE" plan; then
+        node_status "${RED}Automatic maintenance plan blocked${RESET}"
+        write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "FAILED" "automatic maintenance plan blocked"
+        return 1
+      fi
+    else
+      node_status "${CYAN}Restoring HA/CRM settings...${RESET}"
+      if ! maintenance_step "$NODE" restore; then
+        node_status "${RED}Maintenance restoration failed${RESET}"
+        write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "FAILED" "maintenance restoration failed; inspect $TMP_DIR/$NODE.maintenance.json"
+        return 1
+      fi
+    fi
   fi
 
   local RESULT="OK"
@@ -404,6 +509,7 @@ update_node() {
 
   # ---- WRITE SUMMARY FILE ----
   write_summary "$COUNT" "$PKGS" "$RKERNEL" "$LKERNEL" "$NEED_REBOOT" "$RESULT" "$ERROR_TEXT" "$PVEVERSION" "$REBOOT_REASON_TEXT"
+  [ "$RESULT" = "OK" ]
 }
 
 # ---- DETECT CLUSTER NODES ----
@@ -522,7 +628,23 @@ TMP_DIR=$(mktemp -d /tmp/proxmox-update.XXXXXX) || {
   echo -e "${RED}Failed to create temporary directory.${RESET}"
   exit 1
 }
-trap 'rm -rf "$TMP_DIR"' EXIT
+chmod 700 "$TMP_DIR"
+printf 'Diagnostic logs and summaries: %s\n' "$TMP_DIR"
+# Keep logs on failure and success; they contain no SSH keys. Do not unlink while
+# package workers are still running if the controller receives a stop signal.
+interrupt_controller() {
+  local PID
+  for PID in "${NODE_PIDS[@]}"; do kill -TERM "$PID" 2>/dev/null || true; done
+  for PID in "${NODE_PIDS[@]}"; do wait "$PID" 2>/dev/null || true; done
+  echo "Controller interrupted; no further nodes will start. Inspect maintenance state and remote APT before retrying." >&2
+  exit 130
+}
+trap interrupt_controller INT TERM HUP
+
+if ! cluster_gate --selected "$(IFS=,; echo "${NODES[*]}")"; then
+  echo "Initial readiness check failed; no node jobs started." >&2
+  exit 1
+fi
 
 # ---- START UPDATES ----
 echo
@@ -536,6 +658,7 @@ for NODE in "${NODES[@]}"; do
 done
 
 declare -A NODE_LAST_STATUS
+STOP_NEW_JOBS=0
 
 # ---- LIVE DASHBOARD LOOP ----
 while :; do
@@ -548,7 +671,11 @@ while :; do
       if kill -0 "$pid" 2>/dev/null; then
         running_count=$((running_count + 1))
       else
-        wait "$pid" 2>/dev/null
+        if ! wait "$pid"; then STOP_NEW_JOBS=1; fi
+        if ! [ -f "$TMP_DIR/$NODE.summary" ] ||
+           ! grep -q '^RESULT|OK$' "$TMP_DIR/$NODE.summary"; then
+          STOP_NEW_JOBS=1
+        fi
         NODE_DONE["$NODE"]=1
       fi
     fi
@@ -558,7 +685,20 @@ while :; do
     fi
   done
 
+  if [ "$STOP_NEW_JOBS" -eq 1 ]; then
+    for NODE in "${NODES[@]}"; do
+      if [ "${NODE_STARTED[$NODE]}" = "0" ]; then
+        printf 'Skipped after an earlier node failed\n' > "$TMP_DIR/$NODE.status"
+        printf 'RESULT|SKIPPED\nERRORS|Stopped after an earlier node failed\n' > "$TMP_DIR/$NODE.summary"
+        NODE_STARTED["$NODE"]=1
+        NODE_DONE["$NODE"]=1
+        completed_count=$((completed_count + 1))
+      fi
+    done
+  fi
+
   for NODE in "${NODES[@]}"; do
+    [ "$STOP_NEW_JOBS" -eq 1 ] && break
     if [ "$running_count" -ge "$MAX_PARALLEL" ]; then
       break
     fi
@@ -624,6 +764,7 @@ echo -e "${GREEN}${BOLD}All node jobs have finished.${RESET}"
 echo
 
 # ---- COLLECT SUMMARY DATA FROM FILES ----
+REBOOT_UNKNOWN=()
 for NODE in "${NODES[@]}"; do
   SUMMARY_FILE="$TMP_DIR/$NODE.summary"
   COUNT=0
@@ -665,9 +806,13 @@ for NODE in "${NODES[@]}"; do
 
   if [ "$REBOOT" = "1" ]; then
     REBOOT_NEEDED+=("$NODE")
+  elif [[ -z "$RK" || -z "$LK" ]]; then
+    REBOOT_UNKNOWN+=("$NODE")
   fi
 
-  if [ "$RESULT" != "OK" ]; then
+  if [ "$RESULT" = "SKIPPED" ]; then
+    SKIPPED_NODES+=("$NODE")
+  elif [ "$RESULT" != "OK" ]; then
     FAILED_NODES+=("$NODE")
   fi
 done
@@ -677,13 +822,18 @@ clear_screen
 RULE_WIDTH=$(terminal_width)
 print_title "Update Summary"
 print_meta "Mode" "$RUN_MODE"
-print_meta "Nodes" "${#NODES[@]} processed"
+print_meta "Nodes" "${#NODES[@]} selected; $(( ${#NODES[@]} - ${#SKIPPED_NODES[@]} )) attempted"
 print_meta "Failures" "${#FAILED_NODES[@]}"
-print_meta "Reboots" "${#REBOOT_NEEDED[@]}"
+print_meta "Skipped" "${#SKIPPED_NODES[@]}"
+print_meta "Reboots" "${#REBOOT_NEEDED[@]} required; ${#REBOOT_UNKNOWN[@]} unknown"
 echo
 
 if [ ${#REBOOT_NEEDED[@]} -eq 0 ]; then
-  print_meta "Reboots" "${GREEN}none required${RESET}"
+  if [ ${#REBOOT_UNKNOWN[@]} -gt 0 ]; then
+    print_meta "Reboots" "${YELLOW}not determined on ${#REBOOT_UNKNOWN[@]} node(s)${RESET}"
+  else
+    print_meta "Reboots" "${GREEN}none required${RESET}"
+  fi
 else
   print_meta "Reboots" "${YELLOW}required${RESET}"
   for NODE in "${REBOOT_NEEDED[@]}"; do
@@ -721,6 +871,9 @@ for NODE in "${NODES[@]}"; do
   echo -e "${CYAN}${BOLD}$NODE${RESET}"
   if [ "$RESULT" = "OK" ]; then
     print_node_meta "Result" "${GREEN}OK${RESET}"
+  elif [ "$RESULT" = "SKIPPED" ]; then
+    print_node_meta "Result" "${YELLOW}SKIPPED${RESET}"
+    print_node_meta "Reason" "$ERROR_TEXT"
   else
     print_node_meta "Result" "${RED}FAILED${RESET}"
     print_node_meta "Errors" "$ERROR_TEXT"
@@ -728,7 +881,7 @@ for NODE in "${NODES[@]}"; do
   print_node_meta "Changes" "${BOLD}$COUNT${RESET}"
   if [ "$COUNT" -gt 0 ] && [ -n "$PKGLIST" ]; then
     print_node_meta "Packages" ""
-    echo "    $PKGLIST" | fmt -w 70 | sed 's/^/    /'
+    printf '    %s\n' "$PKGLIST"
   else
     print_node_meta "Packages" "None"
   fi
@@ -747,7 +900,9 @@ for NODE in "${NODES[@]}"; do
     print_node_meta "Kernel" "${RED}Could not be determined${RESET}"
   fi
 
-  if [[ -n "$REBOOT_REASON_TEXT" ]]; then
+  if [[ -z "$RK" || -z "$LK" ]]; then
+    print_node_meta "Reboot" "${YELLOW}Could not be determined${RESET}"
+  elif [[ -n "$REBOOT_REASON_TEXT" ]]; then
     print_node_meta "Reboot" "${YELLOW}$REBOOT_REASON_TEXT${RESET}"
   else
     print_node_meta "Reboot" "None detected"
@@ -756,7 +911,7 @@ done
 
 echo
 print_rule
-echo -e "${BOLD}All nodes processed.${RESET}"
+echo -e "${BOLD}Update run finished.${RESET}"
 print_rule
 
 # Automation must receive a failure when any node's package maintenance failed.

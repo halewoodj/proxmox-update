@@ -1,0 +1,216 @@
+{
+  "source": "Installed PVE::HA::Tools::get_verbose_service_state; synthetic inputs only",
+  "cases": [
+    {
+      "internal": "started",
+      "running": 0,
+      "requested": "started",
+      "display": "starting",
+      "expect": "wait"
+    },
+    {
+      "requested": "started",
+      "running": 1,
+      "internal": "started",
+      "display": "started",
+      "expect": "ready"
+    },
+    {
+      "requested": "stopped",
+      "running": 0,
+      "internal": "started",
+      "display": "starting",
+      "expect": "wait"
+    },
+    {
+      "requested": "stopped",
+      "internal": "started",
+      "running": 1,
+      "display": "stopping",
+      "expect": "wait"
+    },
+    {
+      "display": "starting",
+      "requested": "disabled",
+      "running": 0,
+      "internal": "started",
+      "expect": "wait"
+    },
+    {
+      "display": "stopping",
+      "internal": "started",
+      "running": 1,
+      "requested": "disabled",
+      "expect": "wait"
+    },
+    {
+      "internal": "started",
+      "running": 0,
+      "requested": "ignored",
+      "display": "ignored",
+      "expect": "stop"
+    },
+    {
+      "display": "ignored",
+      "running": 1,
+      "internal": "started",
+      "requested": "ignored",
+      "expect": "stop"
+    },
+    {
+      "display": "starting",
+      "running": 0,
+      "internal": "stopped",
+      "requested": "started",
+      "expect": "wait"
+    },
+    {
+      "internal": "stopped",
+      "running": 1,
+      "requested": "started",
+      "display": "starting",
+      "expect": "wait"
+    },
+    {
+      "display": "stopped",
+      "internal": "stopped",
+      "running": 0,
+      "requested": "stopped",
+      "expect": "ready"
+    },
+    {
+      "requested": "stopped",
+      "internal": "stopped",
+      "running": 1,
+      "display": "stopped",
+      "expect": "ready"
+    },
+    {
+      "running": 0,
+      "internal": "stopped",
+      "requested": "disabled",
+      "display": "disabled",
+      "expect": "ready"
+    },
+    {
+      "display": "disabled",
+      "requested": "disabled",
+      "internal": "stopped",
+      "running": 1,
+      "expect": "ready"
+    },
+    {
+      "internal": "stopped",
+      "running": 0,
+      "requested": "ignored",
+      "display": "ignored",
+      "expect": "stop"
+    },
+    {
+      "display": "ignored",
+      "requested": "ignored",
+      "internal": "stopped",
+      "running": 1,
+      "expect": "stop"
+    },
+    {
+      "internal": "request_start",
+      "running": 1,
+      "requested": "started",
+      "display": "request_start",
+      "expect": "wait"
+    },
+    {
+      "display": "request_start_balance",
+      "requested": "started",
+      "internal": "request_start_balance",
+      "running": 1,
+      "expect": "wait"
+    },
+    {
+      "display": "request_stop",
+      "internal": "request_stop",
+      "running": 1,
+      "requested": "started",
+      "expect": "wait"
+    },
+    {
+      "display": "migrate",
+      "running": 1,
+      "internal": "migrate",
+      "requested": "started",
+      "expect": "wait"
+    },
+    {
+      "running": 1,
+      "internal": "relocate",
+      "requested": "started",
+      "display": "relocate",
+      "expect": "wait"
+    },
+    {
+      "display": "freeze",
+      "running": 1,
+      "internal": "freeze",
+      "requested": "started",
+      "expect": "stop"
+    },
+    {
+      "display": "fence",
+      "requested": "started",
+      "running": 1,
+      "internal": "fence",
+      "expect": "stop"
+    },
+    {
+      "display": "recovery",
+      "requested": "started",
+      "running": 1,
+      "internal": "recovery",
+      "expect": "stop"
+    },
+    {
+      "display": "error",
+      "requested": "started",
+      "running": 1,
+      "internal": "error",
+      "expect": "stop"
+    },
+    {
+      "display": "clearing error flag",
+      "internal": "error",
+      "running": 0,
+      "requested": "disabled",
+      "expect": "stop"
+    },
+    {
+      "display": "deleting",
+      "requested": "started",
+      "internal": "started",
+      "missing_conf": 1,
+      "running": 1,
+      "expect": "wait"
+    },
+    {
+      "display": "not found",
+      "requested": "started",
+      "missing_node": 1,
+      "internal": "started",
+      "running": 1,
+      "expect": "stop"
+    },
+    {
+      "running": 0,
+      "requested": "started",
+      "display": "queued",
+      "missing_status": 1,
+      "expect": "wait"
+    },
+    {
+      "requested": "started",
+      "running": 0,
+      "display": "queued",
+      "expect": "wait"
+    }
+  ]
+}
