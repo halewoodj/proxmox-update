@@ -135,8 +135,13 @@ unsafe Ceph states and reboots still stop immediately.
 Logs name the service or migration task being awaited. No next-node maintenance
 request or APT command starts while the handoff is pending.
 
-An active scheduled `vzdump` backup also waits within that bounded readiness
-period. No evacuation or package write begins until the backup task finishes.
+An active scheduled `vzdump` backup has a separate two-hour read-only wait budget
+per readiness, evacuation or maintenance-exit phase (`maintenance.py
+--backup-timeout 7200`). Time spent waiting for a backup does not consume the
+ordinary 30-minute maintenance budget; progress names the backup nodes. Critical
+health faults still stop immediately. Readiness waits for observed backups to
+finish before requesting maintenance, and evacuation waits for any new backup
+before stopping CRM or allowing package writes.
 Other active tasks, including Proxmox `aptupdate` and unknown task types, also
 wait within the same bounded period. None are cancelled or allowed to overlap
 preparation; a task that does not finish times out before the node is changed.

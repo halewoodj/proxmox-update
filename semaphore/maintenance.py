@@ -116,11 +116,12 @@ def check_plan(nodes, target, snapshots):
 
 class Maintenance:
     def __init__(self, nodes, target, path, baseline, *, collect=None, execute=remote,
-                 sleep=time.sleep, clock=time.monotonic, timeout=1800):
+                 sleep=time.sleep, clock=time.monotonic, timeout=1800, backup_timeout=None):
         self.nodes, self.target = nodes, target
         self.path, self.baseline = Path(path), baseline
         self.collect, self.execute = collect, execute
         self.sleep, self.clock, self.timeout = sleep, clock, timeout
+        self.backup_timeout=timeout if backup_timeout is None else backup_timeout
         self.confirmed_epoch=None
 
     def read(self):
@@ -142,18 +143,35 @@ class Maintenance:
         temporary.chmod(0o600)
         temporary.replace(self.path)
 
-    def wait(self, description, predicate, *, consecutive=1):
+    def wait(self, description, predicate, *, consecutive=1, wait_backups=False):
         print('['+self.target+'] Waiting for '+description+'...', flush=True)
-        deadline = self.clock()+self.timeout
+        last=self.clock()
+        ordinary_elapsed=backup_elapsed=0
+        previous_backups=()
         ready_count=0
         while True:
             data = self.read()
+            now=self.clock()
+            backups=tuple(sorted({d['hostname'] for d in data.values()
+                                  if any(t.get('type')=='vzdump' for t in active_work(d))})) if wait_backups else ()
+            if backups or previous_backups:backup_elapsed+=now-last
+            else:ordinary_elapsed+=now-last
+            last=now
+            if backups!=previous_backups:
+                if backups:
+                    print('['+self.target+'] Existing backups on '+', '.join(backups)+
+                          '; waiting without package writes (backup wait budget '+str(self.backup_timeout)+'s).',flush=True)
+                else:
+                    print('['+self.target+'] Existing backups finished; verifying HA readiness.',flush=True)
+            previous_backups=backups
             if predicate(data):
                 ready_count+=1
                 if ready_count>=consecutive:return data
             else:
                 ready_count=0
-            if self.clock() >= deadline:
+            if backups and backup_elapsed>=self.backup_timeout:
+                raise ValueError('Timed out waiting for existing backups during '+description+' on '+self.target)
+            if ordinary_elapsed>=self.timeout:
                 raise ValueError('Timed out waiting for '+description+' on '+self.target)
             if not ready_count:self.sleep(5)
 
@@ -169,7 +187,7 @@ class Maintenance:
                     print('['+self.target+'] '+str(error)+'; waiting before changing this node.',flush=True)
                     last_pending=str(error)
                 return False
-        return self.wait('HA readiness before preparation',ready,consecutive=2)
+        return self.wait('HA readiness before preparation',ready,consecutive=2,wait_backups=True)
 
     def prepare(self):
         if self.path.exists():
@@ -189,7 +207,7 @@ class Maintenance:
         data = self.wait('HA evacuation and stable services',
                          lambda d: all(maintenance_requested(v,self.target)
                                        and lrm_maintenance(v,self.target) and not running(v,self.target)
-                                       and stable(v) and not active_work(v) for v in d.values()))
+                                       and stable(v) and not active_work(v) for v in d.values()),wait_backups=True)
         self.record(state, 'evacuated')
         if state['original_crm_active'] == 'active':
             state['crm_stop_owned'] = True
@@ -238,7 +256,7 @@ class Maintenance:
             self.wait('HA maintenance exit and stable services',
                       lambda d:all(not maintenance_requested(v,self.target)
                                    and not lrm_maintenance(v,self.target) and stable(v)
-                                   and not active_work(v) for v in d.values()),consecutive=2)
+                                   and not active_work(v) for v in d.values()),consecutive=2,wait_backups=True)
         self.read()
         self.record(state, 'restored')
         print('['+self.target+'] Original HA/CRM settings restored; cluster verified.', flush=True)
@@ -252,17 +270,20 @@ def main():
     parser.add_argument('--state', required=True)
     parser.add_argument('--baseline', required=True)
     parser.add_argument('--timeout', type=int, default=1800)
+    parser.add_argument('--backup-timeout', type=int, default=7200,
+                        help='Separate read-only wait budget for existing vzdump tasks (seconds)')
     args = parser.parse_args()
     nodes = args.nodes.split(',')
     if len(nodes)<2 or len(nodes)!=len(set(nodes)) or args.target not in nodes or not all(
             re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',n) for n in nodes):
         raise ValueError('Invalid maintenance node inventory')
-    if args.timeout < 1:
+    if args.timeout < 1 or args.backup_timeout < 1:
         raise ValueError('Maintenance timeout must be positive')
     baseline = json.loads(Path(args.baseline).read_text())
     if set(baseline) != set(nodes):
         raise ValueError('Boot baseline differs from approved inventory')
-    helper = Maintenance(nodes,args.target,args.state,baseline,timeout=args.timeout)
+    helper = Maintenance(nodes,args.target,args.state,baseline,timeout=args.timeout,
+                         backup_timeout=args.backup_timeout)
     getattr(helper,args.action)()
 
 

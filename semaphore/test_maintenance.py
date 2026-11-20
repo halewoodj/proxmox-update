@@ -241,7 +241,7 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_stuck_backup_times_out_without_changes(self):
         self.cluster.data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
-        with self.assertRaisesRegex(ValueError,'Timed out waiting for HA readiness'):
+        with self.assertRaisesRegex(ValueError,'Timed out waiting for existing backups'):
             self.helper.prepare()
         self.assertEqual(self.cluster.commands,[])
         self.assertFalse(self.path.exists())
@@ -301,7 +301,28 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.cluster.commands,[])
         self.assertFalse(self.path.exists())
 
+    def test_normal_backup_can_outlast_the_ordinary_maintenance_wait(self):
+        self.helper.timeout=10
+        self.helper.backup_timeout=60
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads<=4:
+                self.clock.now+=10
+                self.assertEqual(self.cluster.commands,[])
+                self.assertFalse(self.path.exists())
+                data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
+            return data
+        self.helper.collect=collect
+        self.helper.prepare()
+        self.assertGreaterEqual(self.clock.now,40)
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
+
     def test_backup_during_evacuation_waits_through_clean_snapshot_trimming(self):
+        self.helper.timeout=10
+        self.helper.backup_timeout=60
         waiting_reads=0
         def collect():
             nonlocal waiting_reads
@@ -310,15 +331,36 @@ class MaintenanceTests(unittest.TestCase):
                 waiting_reads+=1
                 for d in data.values():
                     d['ceph']['pgmap']['pgs_by_state'][0]['state_name']='active+clean+snaptrim_wait'
-                if waiting_reads<=3:
+                if waiting_reads<=6:
                     self.assertEqual(len(self.cluster.commands),1)
                     data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
             return data
         self.helper.collect=collect
         self.helper.prepare()
-        self.assertGreaterEqual(waiting_reads,4)
-        self.assertGreaterEqual(self.clock.now,15)
+        self.assertGreaterEqual(waiting_reads,7)
+        self.assertGreaterEqual(self.clock.now,30)
         self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
+
+    def test_backup_wait_budget_and_health_failures_remain_limits(self):
+        self.helper.timeout=10
+        self.helper.backup_timeout=20
+        self.cluster.data['NODE-2']['active_tasks']=[{'type':'vzdump'}]
+        with self.assertRaisesRegex(ValueError,'Timed out waiting for existing backups'):
+            self.helper.prepare()
+        self.assertEqual(self.clock.now,20)
+        self.assertEqual(self.cluster.commands,[])
+        self.assertFalse(self.path.exists())
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads==2:data['NODE-1']['quorum']='Quorate: No'
+            return data
+        self.helper.collect=collect
+        with self.assertRaisesRegex(ValueError,'No quorum'):self.helper.prepare()
+        self.assertEqual(reads,2)
+        self.assertEqual(self.cluster.commands,[])
 
     def test_safety_regression_while_waiting_still_aborts_immediately(self):
         for scenario in ['ceph','quorum','reboot','service-error']:
