@@ -81,18 +81,14 @@ def check_plan(nodes, target, snapshots):
                 raise ValueError(node+' already has HA maintenance; prepare only one node at a time')
         pending.extend(service_transitions(observer))
         tasks=active_work(observer)
-        managed={r['sid'] for r in observer['ha_config']}
-        startup_tasks={'qmstart':'vm:','qmstop':'vm:','qmshutdown':'vm:',
-                       'vzstart':'ct:','vzstop':'ct:','vzshutdown':'ct:'}
-        def settling_task(task):
-            kind=task.get('type')
-            return kind in ['qmigrate','vzmigrate','vzdump'] or (kind in startup_tasks
-                    and startup_tasks[kind]+str(task.get('id','')) in managed)
-        if any(not settling_task(t) for t in tasks):
-            raise ValueError('Active Proxmox tasks on '+observer['hostname']+'; wait before maintenance')
+        # An existing task is a reason to wait, including aptupdate and unknown
+        # task types. Nothing is changed until every conflicting task disappears.
+        # The bounded readiness wait still checks health and service errors on
+        # every observation; it never stops or assumes ownership of these tasks.
         pending.extend('Proxmox task '+str(t.get('type'))+
                        (' '+str(t['id']) if t.get('id') else '')+
-                       ' on '+observer['hostname'] for t in tasks)
+                       ' on '+observer['hostname']+
+                       (' ('+str(t['upid'])+')' if t.get('upid') else '') for t in tasks)
     if pending:
         raise MaintenancePending('HA is settling: '+'; '.join(sorted(set(pending))))
     if data['crm_active'] not in ['active','inactive']:

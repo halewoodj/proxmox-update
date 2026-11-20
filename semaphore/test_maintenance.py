@@ -252,7 +252,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.cluster.commands,[])
         self.assertFalse(self.path.exists())
 
-    def test_managed_start_stop_tasks_settle_but_unmanaged_operations_block(self):
+    def test_start_stop_tasks_wait_for_managed_and_unmanaged_guests(self):
         for kind,prefix in [('qmstart','vm:'),('qmstop','vm:'),('qmshutdown','vm:'),
                             ('vzstart','ct:'),('vzstop','ct:'),('vzshutdown','ct:')]:
             with self.subTest(kind=kind):
@@ -261,8 +261,64 @@ class MaintenanceTests(unittest.TestCase):
                 data['NODE-2']['active_tasks']=[{'type':kind,'id':'100'}]
                 with self.assertRaises(MaintenancePending):check_plan(list(data),'NODE-1',data)
                 data['NODE-2']['active_tasks'][0]['id']='999'
-                with self.assertRaisesRegex(ValueError,'Active Proxmox tasks'):
+                with self.assertRaises(MaintenancePending):
                     check_plan(list(data),'NODE-1',data)
+
+    def test_short_apt_refresh_and_unknown_tasks_finish_before_any_changes(self):
+        for kind in ['aptupdate','qmrestore','unknown-task']:
+            with self.subTest(kind=kind):
+                self.setUp();reads=0
+                def collect():
+                    nonlocal reads
+                    reads+=1
+                    data=copy.deepcopy(self.cluster.data)
+                    if reads<=3:
+                        self.assertFalse(self.path.exists())
+                        self.assertEqual(self.cluster.commands,[])
+                        data['NODE-1']['active_tasks']=[{'type':kind,'id':'','upid':'UPID:existing:'}]
+                    return data
+                self.helper.collect=collect
+                self.helper.prepare()
+                self.assertGreaterEqual(self.clock.now,15)
+                self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
+
+    def test_new_apt_refresh_resets_readiness_and_stuck_refresh_times_out(self):
+        reads=0
+        def collect():
+            nonlocal reads
+            reads+=1
+            data=copy.deepcopy(self.cluster.data)
+            if reads==2:data['NODE-1']['active_tasks']=[{'type':'aptupdate','id':''}]
+            return data
+        self.helper.collect=collect
+        self.helper.wait_ready()
+        self.assertEqual(reads,4)
+        self.assertEqual(self.cluster.commands,[])
+        self.cluster.data['NODE-1']['active_tasks']=[{'type':'aptupdate','id':''}]
+        self.helper.collect=lambda:copy.deepcopy(self.cluster.data)
+        with self.assertRaisesRegex(ValueError,'Timed out waiting for HA readiness'):
+            self.helper.prepare()
+        self.assertEqual(self.cluster.commands,[])
+        self.assertFalse(self.path.exists())
+
+    def test_backup_during_evacuation_waits_through_clean_snapshot_trimming(self):
+        waiting_reads=0
+        def collect():
+            nonlocal waiting_reads
+            data=copy.deepcopy(self.cluster.data)
+            if data['NODE-1']['manager'] and not any('stop' in a for a in self.cluster.commands):
+                waiting_reads+=1
+                for d in data.values():
+                    d['ceph']['pgmap']['pgs_by_state'][0]['state_name']='active+clean+snaptrim_wait'
+                if waiting_reads<=3:
+                    self.assertEqual(len(self.cluster.commands),1)
+                    data['NODE-2']['active_tasks']=[{'type':'vzdump','id':''}]
+            return data
+        self.helper.collect=collect
+        self.helper.prepare()
+        self.assertGreaterEqual(waiting_reads,4)
+        self.assertGreaterEqual(self.clock.now,15)
+        self.assertEqual(json.loads(self.path.read_text())['phase'],'prepared')
 
     def test_safety_regression_while_waiting_still_aborts_immediately(self):
         for scenario in ['ceph','quorum','reboot','service-error']:

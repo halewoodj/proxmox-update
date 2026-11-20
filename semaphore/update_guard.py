@@ -148,11 +148,15 @@ def verify_cluster(expected, snapshots, baseline=None):
         if not (osds['num_osds'] == osds['num_up_osds'] == osds['num_in_osds']):
             raise ValueError('Ceph has missing OSDs on ' + node)
         pgmap = ceph['pgmap']
-        safe_states = {'active', 'clean', 'scrubbing', 'deep'}
+        # Snapshot cleanup keeps PGs active and fully replicated. In particular,
+        # scheduled backups can leave snaptrim flags while HEALTH_OK is retained.
+        # See Ceph's pg-states documentation; snaptrim_error is not allowed.
+        safe_states = {'active', 'clean', 'scrubbing', 'deep', 'snaptrim', 'snaptrim_wait'}
         if pgmap['num_pgs'] < 1 or sum(s['count'] for s in pgmap['pgs_by_state']
                                      if {'active','clean'} <= set(s['state_name'].split('+'))
                                      <= safe_states) != pgmap['num_pgs']:
-            raise ValueError('Ceph placement groups are not all active+clean on ' + node)
+            raise ValueError('Ceph placement groups are not all active+clean with supported background states on '
+                             +node+': '+json.dumps(pgmap,sort_keys=True))
         if data['audit']:
             raise ValueError('Unfinished package configuration on ' + node + ': ' + data['audit'])
         daemons = [r for r in data['ha_status'] if r['type'] in ['master','lrm']]

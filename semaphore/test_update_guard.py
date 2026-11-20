@@ -231,10 +231,34 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'election evidence'):
                 verify_cluster(list(data),data)
 
-    def test_clean_background_scrub_is_allowed_but_recovery_is_not(self):
+    def test_clean_background_scrub_is_allowed(self):
         for state in ['active+clean+scrubbing','active+clean+scrubbing+deep']:
             data=healthy();data['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
             verify_cluster(list(data),data)
+
+    def test_backup_snapshot_cleanup_remains_active_and_clean(self):
+        # Task 25814's failure window: all 577 PGs stayed active+clean,
+        # including backup snapshot trimming and normal deep scrubbing.
+        data=healthy()
+        for d in data.values():
+            d['ceph']['pgmap']={'num_pgs':577,'pgs_by_state':[
+                {'state_name':'active+clean+snaptrim','count':22},
+                {'state_name':'active+clean+snaptrim_wait','count':115},
+                {'state_name':'active+clean+scrubbing+deep','count':11},
+                {'state_name':'active+clean','count':429}]}
+        verify_cluster(list(data),data)
+        for state in ['active+clean+snaptrim+scrubbing+deep','active+clean+snaptrim_wait']:
+            value=healthy();value['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
+            verify_cluster(list(value),value)
+
+    def test_cleanup_flags_never_hide_missing_replicas_errors_or_unknown_states(self):
+        for state in ['active+snaptrim','clean+snaptrim','active+clean+snaptrim_error',
+                      'active+clean+laggy','active+clean+degraded+snaptrim',
+                      'active+clean+recovering','active+clean+unexpected']:
+            with self.subTest(state=state):
+                data=healthy();data['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
+                with self.assertRaisesRegex(ValueError,state.replace('+',r'\+')):
+                    verify_cluster(list(data),data)
         for state in ['active+clean+remapped','active+clean+repair','active+clean+unknown']:
             data=healthy();data['NODE-1']['ceph']['pgmap']['pgs_by_state'][0]['state_name']=state
             with self.assertRaises(ValueError):verify_cluster(list(data),data)

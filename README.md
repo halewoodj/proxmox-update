@@ -137,7 +137,10 @@ request or APT command starts while the handoff is pending.
 
 An active scheduled `vzdump` backup also waits within that bounded readiness
 period. No evacuation or package write begins until the backup task finishes.
-Other conflicting/unknown task types still stop the run. An existing maintenance
+Other active tasks, including Proxmox `aptupdate` and unknown task types, also
+wait within the same bounded period. None are cancelled or allowed to overlap
+preparation; a task that does not finish times out before the node is changed.
+An existing maintenance
 hold still requires explicit recovery; the updater does not clear someone else's
 hold to make a full selection proceed.
 
@@ -216,8 +219,10 @@ introduced. Never kill HA daemons or watchdog-mux.
 All modes check every detected cluster member, including nodes excluded from
 installation. They require quorum, fresh HA heartbeats, no boot-ID changes,
 clean/unlocked package databases, Ceph HEALTH_OK with no muted checks, every OSD
-up/in and all PGs active+clean. Normal scrub/deep-scrub flags are permitted;
-recovery, degradation, remapping and unknown states still block the operation.
+up/in and all PGs active+clean. Normal scrub/deep-scrub and snapshot-cleanup
+(`snaptrim` / `snaptrim_wait`) flags are permitted. Trimming errors, recovery,
+degradation, remapping and unknown PG states still block the operation, with the
+actual PG map logged.
 The updater never disarms HA cluster-wide or requests a host reboot.
 
 These controls address unsafe updating of active HA nodes. The underlying cause
